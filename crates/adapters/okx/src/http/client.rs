@@ -105,9 +105,9 @@ use crate::{
         models::OKXInstrument,
         parse::{
             okx_instrument_type, okx_instrument_type_from_symbol, parse_account_state,
-            parse_base_quote_from_symbol, parse_candlestick, parse_fill_report,
+            parse_base_quote_from_symbol, parse_candlestick, parse_fill_report, parse_fill_report_strict,
             parse_index_price_update, parse_instrument_any, parse_mark_price_update,
-            parse_order_status_report, parse_position_status_report, parse_price, parse_quantity,
+            parse_order_status_report, parse_order_status_report_strict, parse_position_status_report, parse_position_status_report_strict, parse_price, parse_quantity,
             parse_spot_margin_position_from_balance, parse_trade_tick,
         },
     },
@@ -204,6 +204,27 @@ impl Debug for OKXRawHttpClient {
             .field("credential", &credential)
             .finish_non_exhaustive()
     }
+}
+
+/// Identity conflicts retain each distinct validated snapshot exactly once.
+enum ReportVariant {
+    First,
+    Duplicate,
+    Conflict,
+}
+
+fn record_report_variant(
+    seen: &mut AHashMap<String, Vec<serde_json::Value>>,
+    key: String,
+    row: serde_json::Value,
+) -> ReportVariant {
+    let variants = seen.entry(key).or_default();
+    if variants.contains(&row) {
+        return ReportVariant::Duplicate;
+    }
+    let outcome = if variants.is_empty() { ReportVariant::First } else { ReportVariant::Conflict };
+    variants.push(row);
+    outcome
 }
 
 impl OKXRawHttpClient {
@@ -907,6 +928,37 @@ impl OKXRawHttpClient {
         .await
     }
 
+    /// Strict report decoding rejects missing timestamp evidence before legacy
+    /// deserializers can substitute zero. Failure rejects the entire typed envelope.
+    async fn get_report_rows<T: DeserializeOwned, P: Serialize>(
+        &self,
+        path: &str,
+        params: &P,
+        strict: bool,
+        timestamps: &[&str],
+    ) -> Result<Vec<T>, OKXHttpError> {
+        if !strict {
+            return self.send_request(Method::GET, path, Some(params), None, true).await;
+        }
+        let rows: Vec<serde_json::Value> = self
+            .send_request(Method::GET, path, Some(params), None, true)
+            .await?;
+        rows.into_iter().enumerate().map(|(index, row)| {
+            for field in timestamps {
+                if row.get(*field).and_then(|value| value.as_str())
+                    .and_then(|text| text.parse::<u64>().ok()).is_none()
+                {
+                    return Err(OKXHttpError::JsonError(format!(
+                        "{path}:row={index}:{field}:invalid_timestamp"
+                    )));
+                }
+            }
+            serde_json::from_value(row).map_err(|_| OKXHttpError::JsonError(format!(
+                "{path}:row={index}:invalid_report_schema"
+            )))
+        }).collect()
+    }
+
     /// Requests order list (pending orders).
     ///
     /// # Errors
@@ -920,14 +972,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetOrderListParams,
     ) -> Result<Vec<OKXOrderHistory>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/trade/orders-pending",
-            Some(&params),
-            None,
-            true,
-        )
-        .await
+        self.get_orders_pending_impl(params, false).await
+    }
+
+    async fn get_orders_pending_impl(
+        &self,
+        params: GetOrderListParams,
+        strict: bool,
+    ) -> Result<Vec<OKXOrderHistory>, OKXHttpError> {
+        self.get_report_rows("/api/v5/trade/orders-pending", &params, strict, &["uTime", "cTime"]).await
     }
 
     /// Requests historical order records.
@@ -943,14 +996,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetOrderHistoryParams,
     ) -> Result<Vec<OKXOrderHistory>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/trade/orders-history",
-            Some(&params),
-            None,
-            true,
-        )
-        .await
+        self.get_orders_history_impl(params, false).await
+    }
+
+    async fn get_orders_history_impl(
+        &self,
+        params: GetOrderHistoryParams,
+        strict: bool,
+    ) -> Result<Vec<OKXOrderHistory>, OKXHttpError> {
+        self.get_report_rows("/api/v5/trade/orders-history", &params, strict, &["uTime", "cTime"]).await
     }
 
     /// Requests pending algo orders.
@@ -1004,14 +1058,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetTransactionDetailsParams,
     ) -> Result<Vec<OKXTransactionDetail>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/trade/fills",
-            Some(&params),
-            None,
-            true,
-        )
-        .await
+        self.get_fills_impl(params, false).await
+    }
+
+    async fn get_fills_impl(
+        &self,
+        params: GetTransactionDetailsParams,
+        strict: bool,
+    ) -> Result<Vec<OKXTransactionDetail>, OKXHttpError> {
+        self.get_report_rows("/api/v5/trade/fills", &params, strict, &["ts"]).await
     }
 
     /// Requests information on your positions. When the account is in net mode, net positions will
@@ -1029,14 +1084,15 @@ impl OKXRawHttpClient {
         &self,
         params: GetPositionsParams,
     ) -> Result<Vec<OKXPosition>, OKXHttpError> {
-        self.send_request(
-            Method::GET,
-            "/api/v5/account/positions",
-            Some(&params),
-            None,
-            true,
-        )
-        .await
+        self.get_positions_impl(params, false).await
+    }
+
+    async fn get_positions_impl(
+        &self,
+        params: GetPositionsParams,
+        strict: bool,
+    ) -> Result<Vec<OKXPosition>, OKXHttpError> {
+        self.get_report_rows("/api/v5/account/positions", &params, strict, &["uTime"]).await
     }
 
     /// Requests closed or historical position data.
@@ -2734,6 +2790,62 @@ impl OKXHttpClient {
         open_only: bool,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        Ok(self.request_order_status_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            start,
+            end,
+            open_only,
+            limit,
+            false,
+        ).await?.0)
+    }
+
+    /// Converts the same response as the legacy method, retaining row failures.
+    /// Nonempty errors prohibit source completion; reports remain positive evidence.
+    /// Transport and envelope/schema failures return Err, never a partial success.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_order_status_reports_with_errors(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        open_only: bool,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, Vec<String>)> {
+        self.request_order_status_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            start,
+            end,
+            open_only,
+            limit,
+            true,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_order_status_reports_impl(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        open_only: bool,
+        limit: Option<u32>,
+        strict: bool,
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, Vec<String>)> {
+        let mut errors = Vec::new();
+        if strict {
+            if let Some(id) = instrument_id {
+                self.instrument_from_cache(id.symbol.inner())?;
+            }
+        }
         let mut history_params = GetOrderHistoryParamsBuilder::default();
 
         let instrument_type = if let Some(instrument_type) = instrument_type {
@@ -2774,14 +2886,14 @@ impl OKXHttpClient {
         let combined_resp = if open_only {
             // Only request pending/open orders
             self.inner
-                .get_orders_pending(pending_params)
+                .get_orders_pending_impl(pending_params, strict)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?
         } else {
             // Make both requests concurrently
             let (history_resp, pending_resp) = tokio::try_join!(
-                self.inner.get_orders_history(history_params),
-                self.inner.get_orders_pending(pending_params)
+                self.inner.get_orders_history_impl(history_params, strict),
+                self.inner.get_orders_pending_impl(pending_params, strict)
             )
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -2801,7 +2913,34 @@ impl OKXHttpClient {
         // Use a seen filter in case pending orders are within the histories "2hr reserve window"
         let mut seen: AHashSet<String> = AHashSet::new();
 
-        for order in combined_resp {
+        let mut validated: AHashMap<String, Vec<serde_json::Value>> = AHashMap::new();
+
+        for (row_index, order) in combined_resp.into_iter().enumerate() {
+            let row_label = format!("orders:row={row_index}:instrument={}:id={}",
+                order.inst_id.as_str().chars().take(80).collect::<String>(),
+                order.ord_id.as_str().chars().take(80).collect::<String>());
+            // Explicit scope is independent of cache membership.
+            if strict && (order.inst_type != instrument_type
+                || instrument_id.is_some_and(|id| id.symbol.inner() != order.inst_id))
+            {
+                continue;
+            }
+            if strict {
+                let Some(raw_ns) = order.u_time.checked_mul(NANOSECONDS_IN_MILLISECOND) else {
+                    errors.push(format!("{row_label}:timestamp:conversion"));
+                    continue;
+                };
+                let timestamp = UnixNanos::from(raw_ns);
+                if start_ns.is_some_and(|start| timestamp < start)
+                    || end_ns.is_some_and(|end| timestamp > end)
+                {
+                    continue;
+                }
+            }
+            if strict && order.c_time.checked_mul(NANOSECONDS_IN_MILLISECOND).is_none() {
+                errors.push(format!("{row_label}:timestamp:conversion"));
+                continue;
+            }
             let seen_key = if !order.cl_ord_id.is_empty() {
                 order.cl_ord_id.as_str().to_string()
             } else if let Some(algo_cl_ord_id) = order
@@ -2820,11 +2959,15 @@ impl OKXHttpClient {
                 order.ord_id.as_str().to_string()
             };
 
-            if !seen.insert(seen_key) {
+            if !strict && !seen.insert(seen_key.clone()) {
                 continue; // Reserved pending already reported
             }
 
+            let raw_row = if strict { Some(serde_json::to_value(&order)?) } else { None };
             let Ok(inst) = self.instrument_from_cache(order.inst_id) else {
+                if strict {
+                    errors.push(format!("{row_label}:instrument:missing"));
+                }
                 log::debug!(
                     "Skipping order report for instrument not in cache: symbol={}",
                     order.inst_id,
@@ -2832,7 +2975,12 @@ impl OKXHttpClient {
                 continue;
             };
 
-            let report = match parse_order_status_report(
+            let convert = if strict {
+                parse_order_status_report_strict
+            } else {
+                parse_order_status_report
+            };
+            let report = match convert(
                 &order,
                 account_id,
                 inst.id(),
@@ -2842,6 +2990,9 @@ impl OKXHttpClient {
             ) {
                 Ok(report) => report,
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("{row_label}:report:conversion"));
+                    }
                     log::error!("Failed to parse order status report: {e}");
                     continue;
                 }
@@ -2859,10 +3010,18 @@ impl OKXHttpClient {
                 continue;
             }
 
+            if strict {
+                let key = seen_key;
+                match record_report_variant(&mut validated, key, raw_row.expect("strict raw row")) {
+                    ReportVariant::Duplicate => continue,
+                    ReportVariant::Conflict => errors.push(format!("{row_label}:duplicate:conflict")),
+                    ReportVariant::First => {},
+                }
+            }
             reports.push(report);
         }
 
-        Ok(reports)
+        Ok((reports, errors))
     }
 
     /// Requests fill reports (transaction details) for the given parameters.
@@ -2883,6 +3042,58 @@ impl OKXHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
+        Ok(self.request_fill_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            start,
+            end,
+            limit,
+            false,
+        ).await?.0)
+    }
+
+    /// Converts the same response as the legacy method, retaining row failures.
+    /// Nonempty errors prohibit source completion; reports remain positive evidence.
+    /// Transport and envelope/schema failures return Err, never a partial success.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_fill_reports_with_errors(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<FillReport>, Vec<String>)> {
+        self.request_fill_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            start,
+            end,
+            limit,
+            true,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_fill_reports_impl(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+        strict: bool,
+    ) -> anyhow::Result<(Vec<FillReport>, Vec<String>)> {
+        let mut errors = Vec::new();
+        if strict {
+            if let Some(id) = instrument_id {
+                self.instrument_from_cache(id.symbol.inner())?;
+            }
+        }
         let mut params = GetTransactionDetailsParamsBuilder::default();
 
         let instrument_type = if let Some(instrument_type) = instrument_type {
@@ -2912,7 +3123,7 @@ impl OKXHttpClient {
 
         let resp = self
             .inner
-            .get_fills(params)
+            .get_fills_impl(params, strict)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -2923,22 +3134,60 @@ impl OKXHttpClient {
         let ts_init = self.generate_ts_init();
         let mut reports = Vec::with_capacity(resp.len());
 
-        for detail in resp {
-            // Skip fills with zero or negative quantity (cancelled orders, etc)
-            if detail.fill_sz.is_empty() {
+        let mut validated: AHashMap<String, Vec<serde_json::Value>> = AHashMap::new();
+
+        for (row_index, detail) in resp.into_iter().enumerate() {
+            let row_label = format!("fills:row={row_index}:instrument={}:id={}",
+                detail.inst_id.as_str().chars().take(80).collect::<String>(),
+                detail.trade_id.as_str().chars().take(80).collect::<String>());
+            // Explicit scope is independent of cache membership.
+            if strict && (detail.inst_type != instrument_type
+                || instrument_id.is_some_and(|id| id.symbol.inner() != detail.inst_id))
+            {
                 continue;
             }
-
-            if let Ok(qty) = detail.fill_sz.parse::<f64>() {
-                if qty <= 0.0 {
+            if strict {
+                let Some(raw_ns) = detail.ts.checked_mul(NANOSECONDS_IN_MILLISECOND) else {
+                    errors.push(format!("{row_label}:timestamp:conversion"));
+                    continue;
+                };
+                let timestamp = UnixNanos::from(raw_ns);
+                if start_ns.is_some_and(|start| timestamp < start)
+                    || end_ns.is_some_and(|end| timestamp > end)
+                {
                     continue;
                 }
+            }
+            if strict {
+                match Decimal::from_str_exact(&detail.fill_sz) {
+                    Ok(qty) if qty <= Decimal::ZERO => continue,
+                    Ok(_) => {},
+                    Err(_) => {
+                        errors.push(format!("{row_label}:fill_quantity:conversion"));
+                        continue;
+                    }
+                }
             } else {
-                // Skip unparsable quantities
-                continue;
+                // Skip fills with zero or negative quantity (cancelled orders, etc)
+                if detail.fill_sz.is_empty() {
+                    continue;
+                }
+
+                if let Ok(qty) = detail.fill_sz.parse::<f64>() {
+                    if qty <= 0.0 {
+                        continue;
+                    }
+                } else {
+                    // Skip unparsable quantities
+                    continue;
+                }
             }
 
+            let raw_row = if strict { Some(serde_json::to_value(&detail)?) } else { None };
             let Ok(inst) = self.instrument_from_cache(detail.inst_id) else {
+                if strict {
+                    errors.push(format!("{row_label}:instrument:missing"));
+                }
                 log::debug!(
                     "Skipping fill report for instrument not in cache: symbol={}",
                     detail.inst_id,
@@ -2946,7 +3195,12 @@ impl OKXHttpClient {
                 continue;
             };
 
-            let report = match parse_fill_report(
+            let convert = if strict {
+                parse_fill_report_strict
+            } else {
+                parse_fill_report
+            };
+            let report = match convert(
                 detail,
                 account_id,
                 inst.id(),
@@ -2956,6 +3210,9 @@ impl OKXHttpClient {
             ) {
                 Ok(report) => report,
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("{row_label}:report:conversion"));
+                    }
                     log::error!("Failed to parse fill report: {e}");
                     continue;
                 }
@@ -2973,10 +3230,18 @@ impl OKXHttpClient {
                 continue;
             }
 
+            if strict {
+                let key = format!("{}:{}", report.instrument_id, report.trade_id);
+                match record_report_variant(&mut validated, key, raw_row.expect("strict raw row")) {
+                    ReportVariant::Duplicate => continue,
+                    ReportVariant::Conflict => errors.push(format!("{row_label}:duplicate:conflict")),
+                    ReportVariant::First => {},
+                }
+            }
             reports.push(report);
         }
 
-        Ok(reports)
+        Ok((reports, errors))
     }
 
     /// Requests current position status reports for the given parameters.
@@ -3011,6 +3276,46 @@ impl OKXHttpClient {
         instrument_type: Option<OKXInstrumentType>,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        Ok(self.request_position_status_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            false,
+        ).await?.0)
+    }
+
+    /// Converts the same response as the legacy method, retaining row failures.
+    /// Nonempty errors prohibit source completion; reports remain positive evidence.
+    /// Transport and envelope/schema failures return Err, never a partial success.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_position_status_reports_with_errors(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<(Vec<PositionStatusReport>, Vec<String>)> {
+        self.request_position_status_reports_impl(
+            account_id,
+            instrument_type,
+            instrument_id,
+            true,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_position_status_reports_impl(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        strict: bool,
+    ) -> anyhow::Result<(Vec<PositionStatusReport>, Vec<String>)> {
+        let mut errors = Vec::new();
+        if strict {
+            if let Some(id) = instrument_id {
+                self.instrument_from_cache(id.symbol.inner())?;
+            }
+        }
         let mut params = GetPositionsParamsBuilder::default();
 
         let instrument_type = if let Some(instrument_type) = instrument_type {
@@ -3033,15 +3338,34 @@ impl OKXHttpClient {
 
         let resp = self
             .inner
-            .get_positions(params)
+            .get_positions_impl(params, strict)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let ts_init = self.generate_ts_init();
         let mut reports = Vec::with_capacity(resp.len());
 
-        for position in resp {
+        let mut validated: AHashMap<String, Vec<serde_json::Value>> = AHashMap::new();
+
+        for (row_index, position) in resp.into_iter().enumerate() {
+            let row_label = format!("positions:row={row_index}:instrument={}:id={}",
+                position.inst_id.as_str().chars().take(80).collect::<String>(),
+                position.pos_id.as_ref().map(|id| id.as_str()).unwrap_or("").chars().take(80).collect::<String>());
+            // Explicit scope is independent of cache membership.
+            if strict && (position.inst_type != instrument_type
+                || instrument_id.is_some_and(|id| id.symbol.inner() != position.inst_id))
+            {
+                continue;
+            }
+            let raw_row = if strict { Some(serde_json::to_value(&position)?) } else { None };
+            if strict && position.u_time.checked_mul(NANOSECONDS_IN_MILLISECOND).is_none() {
+                errors.push(format!("{row_label}:timestamp:conversion"));
+                continue;
+            }
             let Ok(inst) = self.instrument_from_cache(position.inst_id) else {
+                if strict {
+                    errors.push(format!("{row_label}:instrument:missing"));
+                }
                 log::debug!(
                     "Skipping position report for instrument not in cache: symbol={}",
                     position.inst_id,
@@ -3049,21 +3373,39 @@ impl OKXHttpClient {
                 continue;
             };
 
-            match parse_position_status_report(
+            let convert = if strict {
+                parse_position_status_report_strict
+            } else {
+                parse_position_status_report
+            };
+            match convert(
                 position,
                 account_id,
                 inst.id(),
                 inst.size_precision(),
                 ts_init,
             ) {
-                Ok(report) => reports.push(report),
+                Ok(report) => {
+                    if strict {
+                        let key = format!("{}:{:?}", report.instrument_id, report.venue_position_id);
+                        match record_report_variant(&mut validated, key, raw_row.expect("strict raw row")) {
+                            ReportVariant::Duplicate => continue,
+                            ReportVariant::Conflict => errors.push(format!("{row_label}:duplicate:conflict")),
+                            ReportVariant::First => {},
+                        }
+                    }
+                    reports.push(report);
+                },
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("{row_label}:report:conversion"));
+                    }
                     log::error!("Failed to parse position status report: {e}");
                 }
             }
         }
 
-        Ok(reports)
+        Ok((reports, errors))
     }
 
     /// Requests spot margin position status reports from account balance.

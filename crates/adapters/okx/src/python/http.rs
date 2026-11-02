@@ -367,6 +367,44 @@ impl OKXHttpClient {
         })
     }
 
+    #[pyo3(name = "request_order_status_reports_with_errors")]
+    #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, start=None, end=None, open_only=false, limit=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_request_order_status_reports_with_errors<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        open_only: bool,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (reports, errors) = client
+                .request_order_status_reports_with_errors(
+                    account_id,
+                    instrument_type,
+                    instrument_id,
+                    start,
+                    end,
+                    open_only,
+                    limit,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, reports.into_iter().map(|t| t.into_py_any_unwrap(py)))?;
+                Ok((pylist, errors).into_py_any_unwrap(py))
+            })
+        })
+    }
+
     #[pyo3(name = "request_algo_order_status_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, algo_id=None, algo_client_order_id=None, state=None, limit=None))]
     #[allow(clippy::too_many_arguments)]
@@ -463,6 +501,41 @@ impl OKXHttpClient {
         })
     }
 
+    #[pyo3(name = "request_fill_reports_with_errors")]
+    #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, start=None, end=None, limit=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_request_fill_reports_with_errors<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (trades, errors) = client
+                .request_fill_reports_with_errors(
+                    account_id,
+                    instrument_type,
+                    instrument_id,
+                    start,
+                    end,
+                    limit,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist = PyList::new(py, trades.into_iter().map(|t| t.into_py_any_unwrap(py)))?;
+                Ok((pylist, errors).into_py_any_unwrap(py))
+            })
+        })
+    }
+
     #[pyo3(name = "request_position_status_reports")]
     #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None))]
     fn py_request_position_status_reports<'py>(
@@ -484,6 +557,31 @@ impl OKXHttpClient {
                 let pylist =
                     PyList::new(py, reports.into_iter().map(|t| t.into_py_any_unwrap(py)))?;
                 Ok(pylist.into_py_any_unwrap(py))
+            })
+        })
+    }
+
+    #[pyo3(name = "request_position_status_reports_with_errors")]
+    #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None))]
+    fn py_request_position_status_reports_with_errors<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (reports, errors) = client
+                .request_position_status_reports_with_errors(account_id, instrument_type, instrument_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, reports.into_iter().map(|t| t.into_py_any_unwrap(py)))?;
+                Ok((pylist, errors).into_py_any_unwrap(py))
             })
         })
     }

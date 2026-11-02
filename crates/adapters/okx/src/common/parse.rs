@@ -227,6 +227,8 @@ pub fn okx_status_to_market_action(status: OKXInstrumentStatus) -> MarketStatusA
         OKXInstrumentStatus::Suspend => MarketStatusAction::Suspend,
         OKXInstrumentStatus::Preopen => MarketStatusAction::PreOpen,
         OKXInstrumentStatus::Test => MarketStatusAction::NotAvailableForTrading,
+        OKXInstrumentStatus::PostOnly => MarketStatusAction::Quoting,
+        OKXInstrumentStatus::Rebase => MarketStatusAction::NotAvailableForTrading,
     }
 }
 
@@ -497,6 +499,57 @@ pub fn parse_order_status_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
+    parse_order_status_report_impl(
+        order,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+        false,
+    )
+}
+
+/// Strict conversion for source-completion observations.
+pub fn parse_order_status_report_strict(
+    order: &OKXOrderHistory,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    parse_order_status_report_impl(
+        order,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_order_status_report_impl(
+    order: &OKXOrderHistory,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    strict: bool,
+) -> anyhow::Result<OrderStatusReport> {
+    if strict {
+        // Validate raw representability before the existing instrument rounding.
+        Decimal::from_str_exact(&order.sz)?;
+        Decimal::from_str_exact(&order.acc_fill_sz)?;
+        for value in [&order.px, &order.avg_px] {
+            if !value.is_empty() {
+                Decimal::from_str_exact(value)?;
+            }
+        }
+    }
     let okx_ord_type: OKXOrderType = order.ord_type;
     let order_type = determine_order_type(okx_ord_type, &order.px);
 
@@ -542,6 +595,7 @@ pub fn parse_order_status_report(
         // Convert quote quantity to base: quantity_base = sz_quote / price
         let quantity_base = if let (Some(sz), Some(price)) = (sz_quote_dec, conversion_price_dec) {
             if price.is_zero() {
+                anyhow::ensure!(!strict, "Cannot convert quote quantity with zero price");
                 log::warn!(
                     "Cannot convert quote quantity with zero price: ord_id={}, sz={}, using sz as-is",
                     order.ord_id.as_str(),
@@ -555,7 +609,12 @@ pub fn parse_order_status_report(
                     )
                 })?
             } else {
-                let quantity_dec = sz / price;
+                let quantity_dec = if strict {
+                    sz.checked_div(price)
+                        .ok_or_else(|| anyhow::anyhow!("Quote quantity division overflow"))?
+                } else {
+                    sz / price
+                };
                 Quantity::from_decimal_dp(quantity_dec, size_precision).map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to convert quote-to-base quantity for ord_id={}, sz={sz}, price={price}, quantity_dec={quantity_dec}: {e}",
@@ -564,6 +623,7 @@ pub fn parse_order_status_report(
                 })?
             }
         } else {
+            anyhow::ensure!(!strict, "Cannot convert quote quantity without valid size and price");
             log::warn!(
                 "Cannot convert quote quantity without price: ord_id={}, sz={}, px='{}', avg_px='{}', using sz as-is",
                 order.ord_id.as_str(),
@@ -687,18 +747,28 @@ pub fn parse_order_status_report(
         None,
     );
 
-    // Optional fields
-    if !order.px.is_empty()
-        && let Ok(decimal) = Decimal::from_str(&order.px)
-        && let Ok(price) = Price::from_decimal_dp(decimal, price_precision)
-    {
-        report = report.with_price(price);
-    }
+    // Optional means absent is allowed; present but malformed is not absence.
+    if strict {
+        if !order.px.is_empty() {
+            report = report.with_price(parse_price(&order.px, price_precision)?);
+        }
+        if !order.avg_px.is_empty() {
+            report.avg_px = Some(Decimal::from_str(&order.avg_px)?);
+        }
+    } else {
+        // Optional fields
+        if !order.px.is_empty()
+            && let Ok(decimal) = Decimal::from_str(&order.px)
+            && let Ok(price) = Price::from_decimal_dp(decimal, price_precision)
+        {
+            report = report.with_price(price);
+        }
 
-    if !order.avg_px.is_empty()
-        && let Ok(decimal) = Decimal::from_str(&order.avg_px)
-    {
-        report.avg_px = Some(decimal);
+        if !order.avg_px.is_empty()
+            && let Ok(decimal) = Decimal::from_str(&order.avg_px)
+        {
+            report.avg_px = Some(decimal);
+        }
     }
 
     if order.ord_type == OKXOrderType::PostOnly {
@@ -819,7 +889,47 @@ pub fn parse_position_status_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<PositionStatusReport> {
-    let pos_dec = Decimal::from_str(&position.pos).map_err(|e| {
+    parse_position_status_report_impl(
+        position,
+        account_id,
+        instrument_id,
+        size_precision,
+        ts_init,
+        false,
+    )
+}
+
+/// Strict position reports cannot infer flatness from an unknown quantity currency.
+pub fn parse_position_status_report_strict(
+    position: OKXPosition,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<PositionStatusReport> {
+    parse_position_status_report_impl(
+        position,
+        account_id,
+        instrument_id,
+        size_precision,
+        ts_init,
+        true,
+    )
+}
+
+fn parse_position_status_report_impl(
+    position: OKXPosition,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    strict: bool,
+) -> anyhow::Result<PositionStatusReport> {
+    let pos_dec = if strict {
+        Decimal::from_str_exact(&position.pos)
+    } else {
+        Decimal::from_str(&position.pos)
+    }.map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse position quantity '{}' for instrument {}: {e:?}",
             position.pos,
@@ -838,6 +948,10 @@ pub fn parse_position_status_report(
         let (base_ccy, quote_ccy) = parse_base_quote_from_symbol(instrument_id.symbol.as_str())?;
 
         let pos_ccy = position.pos_ccy.as_str();
+        anyhow::ensure!(
+            !strict || pos_dec.is_zero() || !pos_ccy.trim().is_empty(),
+            "Nonzero spot/margin position requires quantity currency",
+        );
 
         if pos_ccy.is_empty() || pos_dec.is_zero() {
             // Flat position: no position or zero quantity
@@ -854,7 +968,11 @@ pub fn parse_position_status_report(
             } else {
                 &position.avg_px
             };
-            let avg_px_dec = Decimal::from_str(avg_px_str)?;
+            let avg_px_dec = if strict {
+                Decimal::from_str_exact(avg_px_str)?
+            } else {
+                Decimal::from_str(avg_px_str)?
+            };
 
             if avg_px_dec.is_zero() {
                 anyhow::bail!(
@@ -862,7 +980,12 @@ pub fn parse_position_status_report(
                 );
             }
 
-            let quantity_dec = pos_dec.abs() / avg_px_dec;
+            let quantity_dec = if strict {
+                pos_dec.abs().checked_div(avg_px_dec)
+                    .ok_or_else(|| anyhow::anyhow!("Position quantity division overflow"))?
+            } else {
+                pos_dec.abs() / avg_px_dec
+            };
             (PositionSide::Short, quantity_dec)
         } else {
             anyhow::bail!(
@@ -926,7 +1049,11 @@ pub fn parse_position_status_report(
     let avg_px_open = if position.avg_px.is_empty() {
         None
     } else {
-        Some(Decimal::from_str(&position.avg_px)?)
+        Some(if strict {
+            Decimal::from_str_exact(&position.avg_px)?
+        } else {
+            Decimal::from_str(&position.avg_px)?
+        })
     };
     let ts_last = parse_millisecond_timestamp(position.u_time);
 
@@ -956,6 +1083,51 @@ pub fn parse_fill_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
+    parse_fill_report_impl(
+        detail,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+        false,
+    )
+}
+
+/// Strict conversion rejects unknown commission facts instead of supplying defaults.
+pub fn parse_fill_report_strict(
+    detail: OKXTransactionDetail,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FillReport> {
+    parse_fill_report_impl(
+        detail,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_fill_report_impl(
+    detail: OKXTransactionDetail,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    strict: bool,
+) -> anyhow::Result<FillReport> {
+    if strict {
+        Decimal::from_str_exact(&detail.fill_px)?;
+        Decimal::from_str_exact(&detail.fill_sz)?;
+    }
     let client_order_id = if detail.cl_ord_id.is_empty() {
         None
     } else {
@@ -966,7 +1138,21 @@ pub fn parse_fill_report(
     let order_side: OrderSide = detail.side.into();
     let last_px = parse_price(&detail.fill_px, price_precision)?;
     let last_qty = parse_quantity(&detail.fill_sz, size_precision)?;
-    let fee_dec = Decimal::from_str(detail.fee.as_deref().unwrap_or("0"))?;
+    let fee_value = if strict {
+        detail.fee.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Missing observed fill fee amount"))?
+    } else {
+        detail.fee.as_deref().unwrap_or("0")
+    };
+    let fee_dec = if strict {
+        Decimal::from_str_exact(fee_value)?
+    } else {
+        Decimal::from_str(fee_value)?
+    };
+    anyhow::ensure!(
+        !strict || fee_dec.is_zero() || !detail.fee_ccy.trim().is_empty(),
+        "Nonzero observed fill fee requires currency",
+    );
     let fee_currency = parse_fee_currency(&detail.fee_ccy, fee_dec, || {
         format!("fill report for instrument_id={instrument_id}")
     });
@@ -4715,5 +4901,25 @@ mod tests {
         #[case] expected: OrderType,
     ) {
         assert_eq!(determine_order_type(okx_ord_type, price), expected);
+    }
+
+    #[rstest]
+    #[case("live", MarketStatusAction::Trading)]
+    #[case("suspend", MarketStatusAction::Suspend)]
+    #[case("preopen", MarketStatusAction::PreOpen)]
+    #[case("test", MarketStatusAction::NotAvailableForTrading)]
+    #[case("post_only", MarketStatusAction::Quoting)]
+    #[case("rebase", MarketStatusAction::NotAvailableForTrading)]
+    fn test_pt_status_wire_contract(#[case] wire: &str, #[case] action: MarketStatusAction) {
+        let status: OKXInstrumentStatus = serde_json::from_value(serde_json::json!(wire)).unwrap();
+        assert_eq!(okx_status_to_market_action(status), action);
+        assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!(wire));
+    }
+
+    #[rstest]
+    fn test_pt_unknown_status_remains_an_error() {
+        assert!(serde_json::from_value::<OKXInstrumentStatus>(
+            serde_json::json!("future_unknown")
+        ).is_err());
     }
 }

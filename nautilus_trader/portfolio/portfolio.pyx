@@ -1730,7 +1730,7 @@ cdef class Portfolio(PortfolioFacade):
         cdef Account account = self._cache.account(event.account_id)
         if account is None:
             # Generate account
-            account = AccountFactory.create_c(event)
+            account = self._cache.create_account(event)
             self._cache.add_account(account)
         else:
             account.apply(event)

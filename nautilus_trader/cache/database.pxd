@@ -18,5 +18,6 @@ from nautilus_trader.serialization.base cimport Serializer
 
 
 cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
+    cdef frozenset _reported_negative_cash_accounts
     cdef Serializer _serializer
     cdef object _backing

@@ -29,6 +29,7 @@ from cpython.datetime cimport timedelta
 from libc.stdint cimport uint8_t
 from libc.stdint cimport uint64_t
 
+from nautilus_trader.accounting.factory cimport AccountFactory
 from nautilus_trader.accounting.accounts.base cimport Account
 from nautilus_trader.cache.facade cimport CacheDatabaseFacade
 from nautilus_trader.common.component cimport LogColor
@@ -54,6 +55,7 @@ from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
 from nautilus_trader.model.events.order cimport OrderUpdated
 from nautilus_trader.model.functions cimport order_status_to_pyo3
+from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ClientOrderId
@@ -95,6 +97,10 @@ cdef class Cache(CacheFacade):
         If `config` is not of type `CacheConfig`.
     """
 
+    cpdef Account create_account(self, AccountState event):
+        return AccountFactory.create_c(event,
+            event.account_id.to_str() in self._reported_negative_cash_accounts)
+
     def __init__(
         self,
         CacheDatabaseFacade database: CacheDatabaseFacade | None = None,
@@ -107,6 +113,8 @@ cdef class Cache(CacheFacade):
 
         self._database = database
         self._log = Logger(name=type(self).__name__)
+
+        self._reported_negative_cash_accounts = frozenset(config.reported_negative_cash_accounts)
 
         # Configuration
         self._drop_instruments_on_reset = config.drop_instruments_on_reset

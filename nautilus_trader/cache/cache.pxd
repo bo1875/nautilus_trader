@@ -35,6 +35,7 @@ from nautilus_trader.model.data cimport IndexPriceUpdate
 from nautilus_trader.model.data cimport MarkPriceUpdate
 from nautilus_trader.model.data cimport QuoteTick
 from nautilus_trader.model.data cimport TradeTick
+from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ClientOrderId
@@ -116,6 +117,9 @@ cdef class Cache(CacheFacade):
     cdef set _index_exec_algorithms
     cdef bint _drop_instruments_on_reset
     cdef Venue _specific_venue
+
+    cdef frozenset _reported_negative_cash_accounts
+    cpdef Account create_account(self, AccountState event)
 
     cdef readonly bint has_backing
     """If the cache has a database backing.\n\n:returns: `bool`"""

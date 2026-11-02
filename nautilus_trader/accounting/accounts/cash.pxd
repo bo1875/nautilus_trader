@@ -17,12 +17,17 @@ from nautilus_trader.accounting.accounts.base cimport Account
 from nautilus_trader.core.rust.model cimport OrderSide
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 
 
 cdef class CashAccount(Account):
+    cdef readonly bint allow_negative_balances
+    cdef bint _applying_reported
+    cdef void _validate_balances(self, list balances, bint reported)
+    cdef void _validate_calculation(self, Currency currency)
     cdef dict _balances_locked
 
     cdef readonly bint allow_borrowing

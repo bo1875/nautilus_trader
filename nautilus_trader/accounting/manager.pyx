@@ -191,6 +191,11 @@ cdef class AccountsManager:
         Condition.not_none(instrument, "instrument")
         Condition.not_none(orders_open, "orders_open")
 
+        if (isinstance(account, CashAccount) and account.allow_negative_balances
+                and not account.calculate_account_state):
+            # Startup/retry initialization must not replace reported wallet
+            # facts with calculated locks. Reported state remains authoritative.
+            return True
         if account.is_cash_account:
             return self._update_balance_locked(
                 account,

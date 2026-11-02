@@ -45,6 +45,7 @@ from nautilus_trader.model.events.order cimport OrderInitialized
 from nautilus_trader.model.functions cimport currency_type_from_str
 from nautilus_trader.model.functions cimport currency_type_to_str
 from nautilus_trader.model.functions cimport order_type_to_str
+from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ClientOrderId
@@ -140,6 +141,7 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
             config = CacheConfig()
         Condition.type(config, CacheConfig, "config")
         super().__init__(config)
+        self._reported_negative_cash_accounts = frozenset(config.reported_negative_cash_accounts)
 
         # Validate configuration
         if config.buffer_interval_ms and config.buffer_interval_ms > 1000:
@@ -643,7 +645,10 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
             return None
 
         cdef bytes initial_event = result.pop(0)
-        cdef Account account = AccountFactory.create_c(self._serializer.deserialize(initial_event))
+        cdef AccountState initial_state = self._serializer.deserialize(initial_event)
+        Condition.equal(initial_state.account_id, account_id, "event.account_id", "account_id")
+        cdef Account account = AccountFactory.create_c(initial_state,
+            initial_state.account_id.to_str() in self._reported_negative_cash_accounts)
 
         cdef bytes event
         for event in result:

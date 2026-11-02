@@ -16,12 +16,12 @@
 //! URL helpers and endpoint metadata for OKX services.
 
 const OKX_HTTP_URL: &str = "https://www.okx.com";
-const OKX_WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
-const OKX_WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
-const OKX_WS_BUSINESS_URL: &str = "wss://ws.okx.com:8443/ws/v5/business";
-const OKX_DEMO_WS_PUBLIC_URL: &str = "wss://wspap.okx.com:8443/ws/v5/public";
-const OKX_DEMO_WS_PRIVATE_URL: &str = "wss://wspap.okx.com:8443/ws/v5/private";
-const OKX_DEMO_WS_BUSINESS_URL: &str = "wss://wspap.okx.com:8443/ws/v5/business";
+const OKX_WS_PUBLIC_URL: &str = "wss://ws.okx.com/ws/v5/public";
+const OKX_WS_PRIVATE_URL: &str = "wss://ws.okx.com/ws/v5/private";
+const OKX_WS_BUSINESS_URL: &str = "wss://ws.okx.com/ws/v5/business";
+const OKX_DEMO_WS_PUBLIC_URL: &str = "wss://wspap.okx.com/ws/v5/public";
+const OKX_DEMO_WS_PRIVATE_URL: &str = "wss://wspap.okx.com/ws/v5/private";
+const OKX_DEMO_WS_BUSINESS_URL: &str = "wss://wspap.okx.com/ws/v5/business";
 
 /// OKX endpoint types for determining URL and authentication requirements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -60,6 +60,9 @@ class CacheConfig(NautilusConfig, frozen=True):
 
     """
 
+    # Exact account IDs, scoped to this cache/node. Never an issuer registry.
+    # Must be bound before kernel cache load; omission keeps strict CASH.
+    reported_negative_cash_accounts: tuple[str, ...] = ()
     database: DatabaseConfig | None = None
     encoding: str = "msgpack"
     timestamps_as_iso8601: bool = False

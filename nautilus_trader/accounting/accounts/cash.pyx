@@ -68,6 +68,10 @@ cdef class CashAccount(Account):
     allow_borrowing : bool, optional
         If borrowing is allowed (negative balances).
 
+    allow_negative_balances : bool, default False
+        Accept signed externally reported balances without allowing borrowing.
+        Calculated accounts and borrowing accounts cannot enable this option.
+
     Raises
     ------
     ValueError
@@ -81,13 +85,20 @@ cdef class CashAccount(Account):
         AccountState event,
         bint calculate_account_state = False,
         bint allow_borrowing = False,
+        bint allow_negative_balances = False,
     ):
         Condition.not_none(event, "event")
         Condition.equal(event.account_type, self.ACCOUNT_TYPE, "event.account_type", "account_type")
 
+        Condition.is_false(allow_negative_balances and (allow_borrowing or calculate_account_state),
+                           "reported negative balances require non-borrowing, reported accounting")
         self.allow_borrowing = allow_borrowing
-
-        super().__init__(event, calculate_account_state)
+        self.allow_negative_balances = allow_negative_balances
+        self._applying_reported = event.is_reported
+        try:
+            super().__init__(event, calculate_account_state)
+        finally:
+            self._applying_reported = False
 
         self._balances_locked: dict[tuple[InstrumentId, Currency], Money] = {}
 
@@ -98,6 +109,7 @@ cdef class CashAccount(Account):
             "type": "CashAccount",
             "calculate_account_state": obj.calculate_account_state,
             "allow_borrowing": obj.allow_borrowing,
+            "allow_negative_balances": obj.allow_negative_balances,
             "events": [AccountState.to_dict_c(event) for event in obj.events_c()]
         }
 
@@ -119,7 +131,8 @@ cdef class CashAccount(Account):
         account = CashAccount(
             event=AccountState.from_dict_c(init_event),
             calculate_account_state=calculate_account_state,
-            allow_borrowing=allow_borrowing
+            allow_borrowing=allow_borrowing,
+            allow_negative_balances=values.get("allow_negative_balances", False),
         )
         for event in other_events:
             account.apply(AccountState.from_dict_c(event))
@@ -149,14 +162,29 @@ cdef class CashAccount(Account):
             If borrowing is not allowed and balance is negative.
 
         """
-        Condition.not_empty(balances, "balances")
-
+        self._validate_balances(balances, self._applying_reported)
         cdef AccountBalance balance
         for balance in balances:
-            if not self.allow_borrowing and balance.total._mem.raw < 0:
-                raise AccountBalanceNegative(balance.total.as_decimal(), balance.currency)
-
             self._balances[balance.currency] = balance
+
+    cdef void _validate_balances(self, list balances, bint reported):
+        Condition.not_empty(balances, "balances")
+        cdef AccountBalance balance
+        cdef set seen = set()
+        cdef bint accept_signed = (self.allow_negative_balances and reported
+                                  and not self.calculate_account_state)
+        for balance in balances:
+            Condition.not_none(balance, "balance")
+            Condition.not_in(balance.currency, seen, "currency", "balances")
+            seen.add(balance.currency)
+            if not self.allow_borrowing and not accept_signed:
+                if balance.total._mem.raw < 0:
+                    raise AccountBalanceNegative(balance.total.as_decimal(), balance.currency)
+                # Opted-in accounts still cannot calculate negative free/locked
+                # amounts. Legacy accounts retain their existing strictness.
+                if self.allow_negative_balances:
+                    Condition.is_true(balance.free._mem.raw >= 0 and balance.locked._mem.raw >= 0,
+                                      "calculated cash balance components must be nonnegative")
 
     cpdef void apply(self, AccountState event):
         """
@@ -175,11 +203,17 @@ cdef class CashAccount(Account):
         System method (not intended to be called by user code).
 
         """
-        # Only clear locks for externally reported state (venue is authoritative)
+        Condition.not_none(event, "event")
+        # Validate every row before Account.apply appends the event or mutates
+        # balances. Its identity/base-currency checks run before any mutation.
+        self._validate_balances(event.balances, event.is_reported)
+        self._applying_reported = event.is_reported
+        try:
+            Account.apply(self, event)
+        finally:
+            self._applying_reported = False
         if event.is_reported:
             self._balances_locked.clear()
-
-        Account.apply(self, event)
 
     cpdef void update_balance_locked(self, InstrumentId instrument_id, Money locked):
         """
@@ -208,6 +242,7 @@ cdef class CashAccount(Account):
 
         cdef Currency currency = locked.currency
 
+        self._validate_calculation(currency)
         self._balances_locked[(instrument_id, currency)] = locked
         self._recalculate_balance(currency)
 
@@ -231,6 +266,9 @@ cdef class CashAccount(Account):
         cdef set[Currency] currencies_to_recalc = set()
 
         for key in keys_to_remove:
+            self._validate_calculation(key[1])
+
+        for key in keys_to_remove:
             currencies_to_recalc.add(key[1])
             del self._balances_locked[key]
 
@@ -243,7 +281,13 @@ cdef class CashAccount(Account):
     cpdef bint is_unleveraged(self, InstrumentId instrument_id):
         return True
 
+    cdef void _validate_calculation(self, Currency currency):
+        cdef AccountBalance balance = self._balances.get(currency)
+        if self.allow_negative_balances and balance is not None and balance.total._mem.raw < 0:
+            raise AccountBalanceNegative(balance.total.as_decimal(), currency)
+
     cdef void _recalculate_balance(self, Currency currency):
+        self._validate_calculation(currency)
         cdef AccountBalance current_balance = self._balances.get(currency)
         if current_balance is None:
             # TODO: Temporary pending reimplementation of accounting

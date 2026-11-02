@@ -3323,6 +3323,42 @@ mod tests {
         }
 
         #[rstest]
+        fn test_pt_mixed_instrument_statuses() {
+            let mut handler = create_handler_with_instruments(vec![]);
+            let value: serde_json::Value = serde_json::from_str(&load_test_json("ws_instruments.json")).unwrap();
+            let cases = [
+                ("live", MarketStatusAction::Trading),
+                ("post_only", MarketStatusAction::Quoting),
+                ("suspend", MarketStatusAction::Suspend),
+                ("rebase", MarketStatusAction::NotAvailableForTrading),
+                ("preopen", MarketStatusAction::PreOpen),
+                ("test", MarketStatusAction::NotAvailableForTrading),
+            ];
+            let rows: Vec<serde_json::Value> = cases.iter().enumerate().map(|(i, (wire, _))| {
+                let mut row = value["data"][0].clone();
+                row["instId"] = serde_json::json!(format!("TEST{i}-USDT-SWAP"));
+                row["state"] = serde_json::json!(wire);
+                row
+            }).collect();
+            let first = handler.handle_instruments_data(
+                serde_json::json!(rows), UnixNanos::from(1_000_000_000u64)
+            ).expect("Mixed array must decode");
+            let messages: Vec<_> = std::iter::once(first)
+                .chain(handler.pending_messages.drain(..)).collect();
+            assert_eq!(messages.len(), cases.len());
+            for (i, (message, (wire, action))) in messages.into_iter().zip(cases).enumerate() {
+                let status = match message {
+                    NautilusWsMessage::Instrument(_, Some(status)) => status,
+                    NautilusWsMessage::InstrumentStatus(status) => status,
+                    other => panic!("Expected status, was {other:?}"),
+                };
+                assert_eq!(status.instrument_id.to_string(), format!("TEST{i}-USDT-SWAP.OKX"));
+                assert_eq!(status.action, action);
+                assert_eq!(status.is_trading, Some(wire == "live"));
+            }
+        }
+
+        #[rstest]
         fn test_handle_instruments_data_emits_instrument_and_status() {
             let mut handler = create_handler_with_instruments(vec![create_swap_instrument()]);
             let json = load_test_json("ws_instruments.json");

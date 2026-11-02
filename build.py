@@ -29,7 +29,7 @@ IS_ARM64 = platform.machine() in ("arm64", "aarch64")
 
 
 # The Rust toolchain to use for builds
-RUSTUP_TOOLCHAIN = os.getenv("RUSTUP_TOOLCHAIN", "stable")
+RUSTUP_TOOLCHAIN = os.environ.setdefault("RUSTUP_TOOLCHAIN", "1.93.1")
 # The Cargo build mode
 BUILD_MODE = os.getenv("BUILD_MODE", "release")
 # If PROFILE_MODE mode is enabled, include traces necessary for coverage and profiling
@@ -166,7 +166,7 @@ def _build_rust_libs() -> None:
 
     try:
         # Build the Rust libraries using Cargo
-        if RUSTUP_TOOLCHAIN not in ("stable", "nightly"):
+        if RUSTUP_TOOLCHAIN != "1.93.1":
             raise ValueError(f"Invalid `RUSTUP_TOOLCHAIN` '{RUSTUP_TOOLCHAIN}'")
 
         needed_crates = [
@@ -197,6 +197,7 @@ def _build_rust_libs() -> None:
         cmd_args = [
             "cargo",
             "build",
+            "--locked",
             "--lib",
             *itertools.chain.from_iterable(("-p", p) for p in needed_crates),
             *build_options,
@@ -324,7 +325,7 @@ def _build_extensions() -> list[Extension]:
 
 
 def _build_distribution(extensions: list[Extension]) -> Distribution:
-    nthreads = os.cpu_count() or 1
+    nthreads = (os.cpu_count() or 1) if PARALLEL_BUILD else 1
     if IS_WINDOWS:
         nthreads = min(nthreads, 60)
     print(f"nthreads={nthreads}")

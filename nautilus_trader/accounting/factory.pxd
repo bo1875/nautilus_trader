@@ -20,4 +20,4 @@ from nautilus_trader.model.events.account cimport AccountState
 cdef class AccountFactory:
 
     @staticmethod
-    cdef Account create_c(AccountState event)
+    cdef Account create_c(AccountState event, bint allow_negative_balances=*)

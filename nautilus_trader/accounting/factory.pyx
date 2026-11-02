@@ -117,7 +117,7 @@ cdef class AccountFactory:
         _ISSUER_CASH_BORROWING.pop(issuer, None)
 
     @staticmethod
-    cdef Account create_c(AccountState event):
+    cdef Account create_c(AccountState event, bint allow_negative_balances=False):
         Condition.not_none(event, "event")
 
         # Parse account issuer
@@ -128,11 +128,16 @@ cdef class AccountFactory:
         cdef bint calculated = _ISSUER_ACCOUNT_CALCULATED.get(issuer, False)
         cdef bint allow_borrowing = _ISSUER_CASH_BORROWING.get(issuer, False)
 
+        if allow_negative_balances:
+            Condition.is_true(event.account_type == AccountType.CASH and account_cls is None
+                              and not calculated and not allow_borrowing,
+                              "reported-negative policy conflicts with account factory settings")
+
         # Create account
         if account_cls is not None:
             return account_cls(event, calculated)
         if event.account_type == AccountType.CASH:
-            return CashAccount(event, calculated, allow_borrowing)
+            return CashAccount(event, calculated, allow_borrowing, allow_negative_balances)
         elif event.account_type == AccountType.MARGIN:
             return MarginAccount(event, calculated)
         elif event.account_type == AccountType.BETTING:
@@ -141,7 +146,7 @@ cdef class AccountFactory:
             raise RuntimeError("invalid `AccountType`")  # pragma: no cover (design-time error)
 
     @staticmethod
-    def create(AccountState event) -> Account:
+    def create(AccountState event, bint allow_negative_balances=False) -> Account:
         """
         Create an account based on the events account type.
 
@@ -155,4 +160,4 @@ cdef class AccountFactory:
         Account
 
         """
-        return AccountFactory.create_c(event)
+        return AccountFactory.create_c(event, allow_negative_balances)
