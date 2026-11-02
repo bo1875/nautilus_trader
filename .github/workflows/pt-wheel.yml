@@ -1,0 +1,78 @@
+name: PT public wheel
+
+on:
+  pull_request:
+    branches: [pt-1.224.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pt-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-cp312:
+    runs-on: ubuntu-24.04
+    container: python:3.12-bookworm@sha256:a5bab0ff300f91231c2e68bf73a8a8d60762ac39ce1c50eaf6803e4c38a9062b
+    timeout-minutes: 360
+    env:
+      RUSTUP_HOME: /opt/rustup
+      CARGO_HOME: /opt/cargo
+      RUSTUP_TOOLCHAIN: 1.93.1
+      CARGO_BUILD_JOBS: "1"
+      CMAKE_BUILD_PARALLEL_LEVEL: "1"
+      PARALLEL_BUILD: "false"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      BUILD_MODE: release
+      HIGH_PRECISION: "true"
+      CC: clang-14
+      CXX: clang++-14
+      COPY_TO_SOURCE: "true"
+      PYTHONDONTWRITEBYTECODE: "1"
+      SOURCE_DATE_EPOCH: "1772514580"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install build tools
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update
+          apt-get install -y --no-install-recommends clang-14 libclang-14-dev capnproto libssl-dev pkg-config redis-server curl ca-certificates
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.93.1
+          printf '/opt/cargo/bin\n' >> "$GITHUB_PATH"
+          python -m pip install --require-hashes -r fork_build/requirements.txt
+      - name: Test OKX Rust contracts
+        run: cargo test --locked --release -p nautilus-okx --lib -- --test-threads=1
+      - name: Build wheel
+        run: |
+          python -I -m build "$GITHUB_WORKSPACE" --wheel --no-isolation --outdir /tmp/public-wheels
+          sha256sum /tmp/public-wheels/*.whl > /tmp/public-wheels/SHA256SUMS
+      - name: Install and qualify the wheel in a separate environment
+        run: |
+          python -m venv /tmp/qualification
+          /tmp/qualification/bin/python -m pip install /tmp/public-wheels/*.whl pytest==7.4.4 pytest-asyncio==0.23.8 aiohttp redis
+          mkdir -p /tmp/native-contracts
+          cp -r fork_tests /tmp/native-contracts/
+          cd /tmp/native-contracts
+          /tmp/qualification/bin/python -I -c 'from importlib.metadata import version; import nautilus_trader as n; from nautilus_trader.core import nautilus_pyo3 as r; assert version("nautilus_trader") == n.__version__ == r.NAUTILUS_VERSION == "1.224.0+pt.fork.1"; assert n.__file__.startswith("/tmp/qualification/")'
+          /tmp/qualification/bin/python -m pytest -q -p no:cacheprovider --runxfail -c /dev/null fork_tests --junitxml=/tmp/public-wheels/native-tests.xml
+          /tmp/qualification/bin/python -m pip freeze > /tmp/public-wheels/installed-packages.txt
+      - name: Record source and compiler identity
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git rev-parse HEAD > /tmp/public-wheels/source-commit.txt
+          rustc --version > /tmp/public-wheels/rustc.txt
+          clang-14 --version > /tmp/public-wheels/clang.txt
+          python --version > /tmp/public-wheels/python.txt
+      - name: Retain candidate artifacts for application qualification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nautilus-pt-linux-cp312
+          path: /tmp/public-wheels/
+          if-no-files-found: error
+          retention-days: 30
