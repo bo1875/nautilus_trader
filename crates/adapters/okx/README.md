@@ -96,13 +96,18 @@ intent time nor venue receipt time, and wall-clock differences are not monotonic
 latency measurements. Success retires response correlation only; orders-channel
 messages remain responsible for confirmed order state.
 
-Diagnostic delivery has a 4,096-observation budget per connection generation.
+Diagnostic delivery admits 4,096 attempts per monotonic 60-second window.
+Reconnect also opens a fresh window without resetting cumulative refusals.
 `observations_dropped` on reconnect is the cumulative number of refused diagnostic
 enqueue attempts, including a closed receiver. It does not measure callback loss
 or missing operations. Reconnect signals bypass this budget. Existing output
 channels remain unbounded; no whole-process memory or complete-history guarantee
 is implied. Python conversion or callback scheduling failures remain logged by
-the existing bridge. These records are ephemeral diagnostics, not a durable ledger.
+the existing bridge. These records are ephemeral diagnostics, not a durable ledger. The independent
+`capture_status()` getter exposes one latest dated immutable `OKXCaptureStatus`,
+including current counters after ordinary event exhaustion. The Python execution
+client offers it through `_handle_ws_capture_status` every five seconds using
+one coalescing lifecycle timer. Close freezes the final date and sequence.
 
 The typed callbacks require a newly built native extension. Older extensions
 continue to work with the Python adapter but cannot provide these notifications.

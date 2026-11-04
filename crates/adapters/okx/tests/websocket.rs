@@ -1042,6 +1042,8 @@ async fn test_true_auto_reconnect_with_verification() {
         .await
         .expect("client inactive");
 
+    let initial_capture = client.capture_status().expect("handler capture missing");
+    assert_eq!(initial_capture.state, "active");
     client
         .subscribe_trades(InstrumentId::from("BTC-USD.OKX"), false)
         .await
@@ -1094,7 +1096,14 @@ async fn test_true_auto_reconnect_with_verification() {
         other => panic!("unexpected message after reconnect: {other:?}"),
     }
 
+    let reconnected_capture = client.capture_status().unwrap();
+    assert_eq!(reconnected_capture.scope_id, initial_capture.scope_id);
+    assert_eq!(reconnected_capture.connection_generation, Some(1));
     client.close().await.expect("close failed");
+    let closed_capture = client.capture_status().unwrap();
+    assert_eq!(closed_capture.state, "closed");
+    client.close().await.expect("idempotent close failed");
+    assert_eq!(client.capture_status().unwrap(), closed_capture);
 }
 
 #[tokio::test]

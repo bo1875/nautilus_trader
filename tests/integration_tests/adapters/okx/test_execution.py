@@ -898,9 +898,10 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
     assert http_client.cancel_algo_order.call_count == 2
 
 
-# =====================================================================================
+# ==============================================================================
+
 # Quote Quantity Order Tests
-# =====================================================================================
+# ==============================================================================
 
 
 @pytest.mark.asyncio
@@ -2142,3 +2143,84 @@ async def test_reconnect_retry_after_failed_startup_has_one_current_recovery(
     finally:
         client.disconnect()
         await eventually(lambda: not client.is_connected)
+
+
+@pytest.mark.asyncio
+async def test_capture_status_client_lifecycle_coalesces_and_contains_failure(
+    exec_client_builder, monkeypatch
+):
+    from nautilus_trader.live.execution_engine import ExecutionCaptureStatus
+
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    rows = []
+    sequence = [0]
+
+    def status(scope, closed=False):
+        sequence[0] += 1
+        return ExecutionCaptureStatus(
+            1,
+            "okx_transport",
+            scope,
+            0,
+            100 + sequence[0],
+            100,
+            60_000_000_000,
+            4096,
+            4096,
+            4096,
+            2,
+            sequence[0],
+            "closed" if closed else "exhausted",
+        )
+
+    private_ws.capture_status = lambda: status("private")
+    business_ws.capture_status = lambda: status("business")
+    client._handle_ws_capture_status = rows.append
+    client._start_ws_capture_status()
+    assert len(rows) == 2
+    old = client._ws_capture_status_handle
+    client._start_ws_capture_status()
+    assert old.cancelled()
+    assert len(rows) == 4
+
+    def fail(_):
+        raise RuntimeError("synthetic diagnostic consumer failure")
+
+    client._handle_ws_capture_status = fail
+    client._ws_capture_status_handle.cancel()
+    client._ws_capture_status_tick()
+    assert client._ws_capture_status_failures == 2
+    assert client._ws_capture_status_handle is not None
+    client._handle_ws_capture_status = rows.append
+    final_private = status("private", True)
+    final_business = status("business", True)
+    private_ws.capture_status = lambda: final_private
+    business_ws.capture_status = lambda: final_business
+    old = client._ws_capture_status_handle
+    await client._disconnect()
+    assert old.cancelled()
+    assert client._ws_capture_status_handle is None
+    assert rows[-2:] == [final_private, final_business]
+    count = len(rows)
+    client._offer_ws_capture_status(closed_only=True)
+    client._ws_capture_status_tick()
+    assert len(rows) == count
+    assert client._ws_capture_status_handle is None
+
+
+@pytest.mark.asyncio
+async def test_capture_status_legacy_extension_and_disconnect_failure(
+    exec_client_builder, monkeypatch
+):
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    private_ws.capture_status = None
+    business_ws.capture_status = None
+    client._start_ws_capture_status()
+    assert client._ws_capture_status_failures == 0
+    handle = client._ws_capture_status_handle
+    private_ws.is_closed.return_value = False
+    private_ws.close.side_effect = RuntimeError("synthetic close failure")
+    with pytest.raises(RuntimeError, match="synthetic close failure"):
+        await client._disconnect()
+    assert handle.cancelled()
+    assert client._ws_capture_status_handle is None

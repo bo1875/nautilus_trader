@@ -90,6 +90,18 @@ pub struct OKXRequestObservation {
     pub ts_observed_ns: u64,
     pub outcome: String,
     pub response_code: Option<String>,
+    /// Present only for a forwarded lifecycle event; never a synthetic operation join.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub ts_received_ns: Option<u64>,
+    /// Venue clock, not comparable to local times without clock calibration.
+    #[serde(default)]
+    pub ts_venue_ns: Option<u64>,
+    #[serde(default)]
+    pub observed_price: Option<String>,
+    #[serde(default)]
+    pub observed_size: Option<String>,
 }
 
 /// Reconnect requires recovery even with no outstanding transport correlations.
