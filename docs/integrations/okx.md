@@ -378,6 +378,34 @@ Only use manual override if you have specific requirements that cannot be met th
 | Order status updates | ✓                     | Real-time order state changes.            |
 | Trade history        | ✓                     | Execution and fill reports.               |
 
+`generate_order_status_reports` returns a list only when the requested query completes.
+Transport, instrument-cache and conversion failures raise `IncompleteOrderStatusReports`
+(from `nautilus_trader.live.reconciliation`). Its `reports` attribute retains valid
+positive observations, including reports collected before another instrument type fails.
+Callers may apply these observations, but must not infer absence or successful completion
+from this list. Cancellation propagates as `asyncio.CancelledError`.
+
+`generate_order_status_report` may return a matching positive observation from an
+incomplete query. Without a match it raises; it returns `None` only after a successful
+negative query within the existing endpoint and history scope. Algo fallback failures
+also propagate. This changes the previous error-to-empty/error-to-None behavior; wrappers
+must retain unresolved state on exceptions. It uses the existing Rust
+`request_order_status_reports_with_errors` contract and requires no new binary API.
+
+Fill and position readers also use the existing strict Rust report methods and propagate
+failures. The optional SPOT wallet reader propagates query and conversion failures;
+verified zero or sub-increment balances still produce flat reports. The static
+`OKXExecutionClient._mass_status_reports_complete` capability identifies this reader
+contract. It is never a last-call success flag: each `generate_mass_status` invocation
+returns a report only when all its readers succeed, returns `None` on failure, and
+propagates cancellation. An overlapping successful call cannot certify a failed call.
+
+The live engine applies positive bulk observations while skipping absence checks for an
+incomplete cycle. At the inflight retry limit it performs a final targeted query before
+resolving an order. Failed reads, failed local application, missing clients, and local
+activity during that query leave the order unresolved. Retry and timer settings remain
+unchanged.
+
 ### Contingent orders
 
 | Feature             | Linear Perpetual Swap | Notes                                      |

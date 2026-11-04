@@ -53,6 +53,7 @@ from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.enqueue import ThrottledEnqueuer
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.live.reconciliation import adjust_fills_for_partial_window
 from nautilus_trader.live.reconciliation import calculate_reconciliation_price
 from nautilus_trader.live.reconciliation import create_inferred_order_filled_event
@@ -819,10 +820,11 @@ class LiveExecutionEngine(ExecutionEngine):
 
                 self._log.warning(
                     f"Order {order.client_order_id!r} exceeded max inflight retries ({retries}), "
-                    f"resolving as failed",
+                    f"checking venue before resolution",
                     LogColor.YELLOW,
                 )
-                self._resolve_inflight_order(order)
+                if await self._query_order_absence(order):
+                    self._resolve_inflight_order(order)
             else:
                 self._log.debug(f"Querying {order} with venue...")
                 query_ts = self._clock.timestamp_ns()
@@ -1290,7 +1292,11 @@ class LiveExecutionEngine(ExecutionEngine):
                 self._log.debug("No execution clients to check orders consistency, early return")
                 return
 
-            all_order_reports, venue_reported_ids = await self._query_order_status_reports()
+            try:
+                all_order_reports, venue_reported_ids = await self._query_order_status_reports()
+            except IncompleteOrderStatusReports as e:
+                self._reconcile_order_reports(e.reports, open_order_ids)
+                return  # Positive observations do not certify absence for this cycle.
 
             self._reconcile_order_reports(all_order_reports, open_order_ids)
 
@@ -1401,23 +1407,21 @@ class LiveExecutionEngine(ExecutionEngine):
                     f"Order {client_order_id!r} not found at venue, retry {retries + 1}/{self.open_check_missing_retries}",
                 )
 
-    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
-        ts_now = self._clock.timestamp_ns()
-
-        self._log.debug(
-            f"Performing single-order query for {order.client_order_id!r} before marking as REJECTED",
-            LogColor.BLUE,
-        )
-
+    async def _query_order_absence(self, order: Order) -> bool:
+        # Only a complete negative response for unchanged local state establishes absence.
         client_id = self._cache.client_id(order.client_order_id)
         if client_id is None:
             self._log.warning(
                 f"No client_id found for {order.client_order_id!r}, skipping targeted query",
             )
-            # Skip targeted query but proceed with resolution
+            return False  # Without a query there is no evidence of absence.
         else:
             client = self._clients.get(client_id)
+            if client is None:
+                self._log.warning(f"No execution client for {order.client_order_id!r}; unresolved")
+                return False
 
+            phase = "query"
             try:
                 query_ts = self._clock.timestamp_ns()
                 command = GenerateOrderStatusReport(
@@ -1429,17 +1433,39 @@ class LiveExecutionEngine(ExecutionEngine):
                 )
 
                 self._ts_last_query[order.client_order_id] = query_ts
+                last_event = order.last_event
+                local_activity = self._order_local_activity_ns.get(order.client_order_id)
                 report = await client.generate_order_status_report(command)
+                if (
+                    order.last_event is not last_event
+                    or self._order_local_activity_ns.get(order.client_order_id) != local_activity
+                ):
+                    self._log.debug(
+                        f"Deferring resolution for {order.client_order_id!r}: activity during query",
+                    )
+                    return False
                 if report is not None:
                     self._log.info(
                         f"Found {order.client_order_id!r} via targeted query: {report.order_status}",
                         LogColor.BLUE,
                     )
+                    phase = "reconcile"
                     self._reconcile_order_report(report, trades=[])
-                    return  # Order found and reconciled, no need to mark as rejected
+                    return False  # A positive report cannot establish absence.
             except Exception as e:
-                self._log.warning(f"Error during targeted query for {order.client_order_id!r}: {e}")
+                self._log.warning(
+                    f"Targeted order resolution unresolved for {order.client_order_id!r}: "
+                    f"phase={phase}, error={type(e).__name__}",
+                )
+                return False
 
+        return True
+
+    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
+        if not await self._query_order_absence(order):
+            return
+
+        ts_now = self._clock.timestamp_ns()
         if not order.is_open:
             self._log.debug(
                 f"Skipping reconciliation for {order.client_order_id!r} - already {order.status_string()}",
@@ -1549,8 +1575,14 @@ class LiveExecutionEngine(ExecutionEngine):
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
 
+        incomplete = False
         for reports_or_exception in order_reports_all:
+            if isinstance(reports_or_exception, asyncio.CancelledError):
+                raise reports_or_exception
             if isinstance(reports_or_exception, Exception):
+                incomplete = True
+                if isinstance(reports_or_exception, IncompleteOrderStatusReports):
+                    all_order_reports.extend(reports_or_exception.reports)
                 self._log.error(
                     f"Failed to generate order status reports: {reports_or_exception}",
                 )
@@ -1558,6 +1590,9 @@ class LiveExecutionEngine(ExecutionEngine):
 
             reports = cast(list[OrderStatusReport], reports_or_exception)
             all_order_reports.extend(reports)
+
+        if incomplete:
+            raise IncompleteOrderStatusReports(all_order_reports)
 
         venue_reported_ids: set[ClientOrderId] = {
             report.client_order_id

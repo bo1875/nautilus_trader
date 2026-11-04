@@ -34,6 +34,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import QueryOrder
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OrderSide
@@ -531,6 +532,9 @@ async def test_check_orders_consistency_handles_client_exception(
     order.apply(accepted)
     exec_engine.process(accepted)
 
+    cache.update_order(order)
+    assert order.client_order_id in cache.client_order_ids_open()
+
     # Make client raise exception - patch the method on the registered client
     async def raise_error(command):
         raise RuntimeError("API error")
@@ -543,6 +547,7 @@ async def test_check_orders_consistency_handles_client_exception(
 
     # Assert
     assert order.status == OrderStatus.ACCEPTED
+    assert order.client_order_id not in exec_engine._recon_check_retries
 
 
 @pytest.mark.asyncio
@@ -679,17 +684,18 @@ async def test_check_inflight_orders_skips_when_recent_query_pending(
 @pytest.mark.asyncio
 async def test_check_inflight_orders_respects_retry_limit(
     exec_engine_inflight_check,
+    exec_client,
     cache,
     account_id,
     clock,
 ):
     """
-    Test _check_inflight_orders stops querying after max retries.
+    Test _check_inflight_orders requires a final negative query after max retries.
     """
     # Arrange
     exec_engine = exec_engine_inflight_check
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Submit order (makes it inflight)
     submitted_event = TestEventStubs.order_submitted(
@@ -1545,7 +1551,7 @@ async def test_accepted_order_not_found_at_venue_reconciles_to_rejected(
     """
     # Arrange
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to be checked
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -1590,7 +1596,7 @@ async def test_partially_filled_order_not_found_at_venue_reconciles_to_canceled(
         instrument=AUDUSD_SIM,
         quantity=Quantity.from_int(100),
     )
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to be checked
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -1702,7 +1708,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     )
 
     # Order1: ACCEPTED and exists at venue
-    cache.add_order(order1)
+    cache.add_order(order1, client_id=exec_client.id)
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
     submitted1 = TestEventStubs.order_submitted(order1, account_id=account_id, ts_event=old_ts)
     accepted1 = TestEventStubs.order_accepted(order1, account_id=account_id, ts_event=old_ts)
@@ -1713,7 +1719,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     cache.update_order(order1)
 
     # Order2: ACCEPTED but NOT at venue
-    cache.add_order(order2)
+    cache.add_order(order2, client_id=exec_client.id)
     submitted2 = TestEventStubs.order_submitted(order2, account_id=account_id, ts_event=old_ts)
     accepted2 = TestEventStubs.order_accepted(order2, account_id=account_id, ts_event=old_ts)
     order2.apply(submitted2)
@@ -1723,7 +1729,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     cache.update_order(order2)
 
     # Order3: FILLED (not at venue is normal)
-    cache.add_order(order3)
+    cache.add_order(order3, client_id=exec_client.id)
     submitted3 = TestEventStubs.order_submitted(order3, account_id=account_id, ts_event=old_ts)
     accepted3 = TestEventStubs.order_accepted(order3, account_id=account_id, ts_event=old_ts)
     filled3 = TestEventStubs.order_filled(order3, instrument=AUDUSD_SIM, ts_event=old_ts)
@@ -1786,7 +1792,7 @@ async def test_missing_order_respects_retry_threshold(
     exec_engine.open_check_missing_retries = 2  # Set threshold to 2
 
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to check (older than threshold)
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -2090,7 +2096,7 @@ async def test_open_check_full_history_mode_does_reject_missing_orders(
         instrument=AUDUSD_SIM,
         client_order_id=ClientOrderId("O-456"),
     )
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to check
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -2507,12 +2513,9 @@ async def test_query_order_status_reports_handles_exceptions(exec_engine_open_ch
 
     exec_client.generate_order_status_reports = raise_error
 
-    # Act
-    all_reports, venue_reported_ids = await exec_engine_open_check._query_order_status_reports()
-
-    # Assert
-    assert len(all_reports) == 0
-    assert len(venue_reported_ids) == 0
+    with pytest.raises(IncompleteOrderStatusReports) as exc:
+        await exec_engine_open_check._query_order_status_reports()
+    assert exc.value.reports == []
 
 
 @pytest.mark.asyncio
@@ -3234,3 +3237,182 @@ async def test_reconcile_order_reports_proceeds_after_threshold_exceeded(
 
     # Assert - reconciliation should proceed since activity is past threshold
     assert reconciled_count == 1, "Reconciliation should proceed when threshold exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_fill", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["transport", "application", "missing_client", "unregistered_client"]
+)
+async def test_periodic_targeted_failure_preserves_order(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    partial_fill,
+    failure,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    client_id = None if failure == "missing_client" else exec_client.id
+    if failure == "unregistered_client":
+        client_id = ClientId("UNREGISTERED")
+    cache.add_order(order, client_id=client_id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+    if partial_fill:
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                instrument=AUDUSD_SIM,
+                last_qty=Quantity.from_int(50),
+            )
+        )
+    cache.update_order(order)
+    before = list(order.events)
+    status = order.status
+    filled_qty = order.filled_qty
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+
+    async def targeted(command):
+        if failure == "transport":
+            raise TimeoutError("Synthetic read timeout")
+        return OrderStatusReport(
+            account_id=account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.FILLED,
+            price=order.price,
+            quantity=order.quantity,
+            filled_qty=order.quantity,
+            report_id=UUID4(),
+            ts_accepted=0,
+            ts_last=0,
+            ts_init=0,
+        )
+
+    def fail_application(report, trades):
+        raise TypeError("Synthetic local reconciliation failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", targeted)
+    if failure == "application":
+        monkeypatch.setattr(engine, "_reconcile_order_report", fail_application)
+
+    await engine._check_orders_consistency()
+
+    assert order.status == status
+    assert order.filled_qty == filled_qty
+    assert order.events == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["submitted", "pending_update", "pending_cancel"])
+async def test_inflight_read_failure_cannot_resolve_timeout(
+    exec_engine_inflight_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    state,
+):
+    engine = exec_engine_inflight_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    if state != "submitted":
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+        event = getattr(TestEventStubs, f"order_{state}")(order, ts_event=0)
+        order.apply(event)
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = engine.inflight_check_max_retries
+
+    async def failed_read(command):
+        raise TimeoutError("Synthetic read timeout")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", failed_read)
+    await engine._check_inflight_orders()
+
+    assert order.events == before
+    assert order.is_inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ["absent", "new_fill", "new_activity", "positive", "apply_error", "apply_unresolved", "cancel"],
+)
+async def test_inflight_threshold_requires_current_absence(
+    exec_engine_inflight_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    outcome,
+):
+    engine = exec_engine_inflight_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    engine._recon_check_retries[order.client_order_id] = engine.inflight_check_max_retries
+
+    async def read(command):
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        if outcome == "new_fill":
+            order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+            order.apply(
+                TestEventStubs.order_filled(
+                    order, instrument=AUDUSD_SIM, last_qty=Quantity.from_int(50)
+                )
+            )
+            cache.update_order(order)
+        if outcome == "new_activity":
+            engine._order_local_activity_ns[order.client_order_id] = engine._clock.timestamp_ns()
+        if outcome in ("positive", "apply_error", "apply_unresolved"):
+            return OrderStatusReport(
+                account_id=account_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=VenueOrderId("1"),
+                order_side=order.side,
+                order_type=order.order_type,
+                time_in_force=order.time_in_force,
+                order_status=OrderStatus.ACCEPTED,
+                price=order.price,
+                quantity=order.quantity,
+                filled_qty=Quantity.from_int(0),
+                report_id=UUID4(),
+                ts_accepted=0,
+                ts_last=0,
+                ts_init=0,
+            )
+        return None
+
+    def apply(report, trades):
+        if outcome == "apply_error":
+            raise TypeError("Synthetic reconciliation failure")
+        return False
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", read)
+    if outcome in ("apply_error", "apply_unresolved"):
+        monkeypatch.setattr(engine, "_reconcile_order_report", apply)
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await engine._check_inflight_orders()
+    else:
+        await engine._check_inflight_orders()
+
+    expected_status = {
+        "absent": OrderStatus.REJECTED,
+        "new_fill": OrderStatus.PARTIALLY_FILLED,
+        "positive": OrderStatus.ACCEPTED,
+    }.get(outcome, OrderStatus.SUBMITTED)
+    assert order.status == expected_status
+    assert order.filled_qty == Quantity.from_int(50 if outcome == "new_fill" else 0)
