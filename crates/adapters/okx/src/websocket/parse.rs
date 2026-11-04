@@ -126,6 +126,41 @@ pub enum ParsedOrderEvent {
     StatusOnly(Box<OrderStatusReport>),
 }
 
+/// Parses authoritative order terms independently of fills or prior adapter state.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn parse_order_updated(
+    msg: &OKXOrderMsg,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderUpdated> {
+    let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
+    let price = if is_market_price(&msg.px) {
+        None
+    } else {
+        Some(parse_price(&msg.px, instrument.price_precision())?)
+    };
+    Ok(OrderUpdated::new(
+        trader_id,
+        strategy_id,
+        instrument.id(),
+        client_order_id,
+        quantity,
+        UUID4::new(),
+        parse_millisecond_timestamp(msg.u_time),
+        ts_init,
+        false, // An orders push is not a reconciliation report.
+        Some(VenueOrderId::new(msg.ord_id)),
+        Some(account_id),
+        price,
+        None,
+        None,
+    ))
+}
+
 /// Snapshot of order state for detecting updates.
 #[derive(Debug, Clone)]
 pub struct OrderStateSnapshot {
@@ -183,30 +218,16 @@ pub fn parse_order_event(
         && let Some(prev) = previous_state
         && is_order_updated_excluding_venue_id_for_live(msg, prev, instrument)?
     {
-        let ts_event = parse_millisecond_timestamp(msg.u_time);
-        let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
-        let price = if is_market_price(&msg.px) {
-            None
-        } else {
-            Some(parse_price(&msg.px, instrument.price_precision())?)
-        };
-
-        return Ok(ParsedOrderEvent::Updated(OrderUpdated::new(
+        return parse_order_updated(
+            msg,
+            client_order_id,
+            account_id,
             trader_id,
             strategy_id,
-            instrument_id,
-            client_order_id,
-            quantity,
-            UUID4::new(),
-            ts_event,
+            instrument,
             ts_init,
-            false, // reconciliation
-            Some(venue_order_id),
-            Some(account_id),
-            price,
-            None, // trigger_price
-            None, // protection_price
-        )));
+        )
+        .map(ParsedOrderEvent::Updated);
     }
 
     match msg.state {

@@ -664,12 +664,18 @@ For additional features or to contribute to the OKX adapter, please see our
 
 ### Confirmed order terms and diagnostics
 
-Orders-channel observations seed confirmed price and quantity even when a
-placement response already emitted acceptance. A successful amend response still
+The first orders-channel snapshot delivers confirmed price and quantity to the
+native cache even when a placement response already emitted acceptance, and
+before any fill carried by that snapshot. A successful amend response still
 only retires transport correlation; it does not confirm terms. ACCEPTED status
 reports reconcile changed terms without generating another acceptance for an
 open or pending order. Unchanged or older reports leave pending operations alone.
-Terminal orders cannot reopen, and an update cannot reduce quantity below fills.
+Equal venue timestamps do not identify duplicates: differing authoritative
+terms at the same millisecond can apply. Strictly older terms remain fenced.
+Already applied update UUIDs are checked against the existing order history.
+Websocket updates cannot change terminal orders. Authoritative reconciliation
+may correct a canceled order's terms before real late fills; the terms update
+alone leaves it canceled. No update can reduce quantity below fills.
 Periodic reconciliation remains necessary for missing messages and recovery.
 
 `OKXRequestObservation` retains schema 1 request fields and adds optional
@@ -693,7 +699,9 @@ The live execution engine publishes immutable `OrderApplyObservation` tuples on
 `ts_observed_ns`, `outcome`, and `observations_dropped`. `applied` means that the
 native cache accepted that event UUID, not durable persistence or settlement.
 Other outcomes are `not_applied`, `error`, `stale`, `terminal`, `below_filled`, and
-`duplicate`. Subscribers must enqueue without blocking. Subscriber errors do
+`duplicate` and `unchanged`. `unchanged` means no cached event or terms were
+mutated and a pending operation remains pending; it does not acknowledge that
+operation. Subscribers must enqueue without blocking. Subscriber errors do
 not change lifecycle processing. No correlation history is retained.
 
 Ordinary transport and engine apply diagnostics each admit 4,096 publication

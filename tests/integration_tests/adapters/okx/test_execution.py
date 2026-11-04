@@ -904,7 +904,6 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
 # ==============================================================================
 
 
-
 @pytest.mark.asyncio
 async def test_spot_margin_market_buy_denies_order_without_quote_quantity(
     exec_client_builder,

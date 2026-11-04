@@ -79,7 +79,7 @@ use super::{
     parse::{
         OrderStateSnapshot, ParsedOrderEvent, extract_fees_from_cached_instrument,
         parse_algo_order_msg, parse_book_msg_vec, parse_order_event, parse_order_msg,
-        parse_ws_message_data,
+        parse_order_updated, parse_ws_message_data,
     },
     subscription::topic_from_websocket_arg,
 };
@@ -1804,7 +1804,7 @@ impl OKXWsFeedHandler {
             // pass through their existing trade-id/cumulative-quantity safeguards.
             if msg.state == OKXOrderStatus::Live
                 && previous_state.as_ref().is_some_and(|previous| {
-                    parse_millisecond_timestamp(msg.u_time) <= previous.ts_event
+                    parse_millisecond_timestamp(msg.u_time) < previous.ts_event
                 })
             {
                 observation.outcome = "stale_or_duplicate".into();
@@ -1829,54 +1829,40 @@ impl OKXWsFeedHandler {
                     ts_init,
                 ) {
                     Ok(event) => {
-                        if let ParsedOrderEvent::Updated(updated) = &event {
-                            let filled = previous_filled_qty
-                                .unwrap_or_else(|| Quantity::zero(size_precision));
-                            let reported_filled = parse_quantity(
-                                msg.acc_fill_sz.as_deref().unwrap_or("0"),
-                                size_precision,
+                        // The first authoritative limit snapshot must reach the native
+                        // cache even if an ACK already emitted acceptance. Submitted or
+                        // acknowledged terms never seed this confirmed-state cache.
+                        let first_terms = previous_state.is_none()
+                            && !is_market_price(&msg.px)
+                            && matches!(
+                                &event,
+                                ParsedOrderEvent::Accepted(_) | ParsedOrderEvent::Fill(_)
+                            );
+                        let terms = if first_terms {
+                            parse_order_updated(
+                                &msg,
+                                canonical_client_id,
+                                self.account_id,
+                                trader_id,
+                                strategy_id,
+                                instrument,
+                                ts_init,
                             )
-                            .ok();
-                            if updated.quantity < filled
-                                || reported_filled.is_some_and(|qty| updated.quantity < qty)
-                            {
-                                observation.outcome = "below_filled".into();
-                                self.emit_request_observation(observation);
-                                continue;
-                            }
-                            if previous_state
-                                .as_ref()
-                                .is_some_and(|previous| updated.ts_event <= previous.ts_event)
-                            {
-                                observation.outcome = "stale_or_duplicate".into();
-                                self.emit_request_observation(observation);
-                                continue;
-                            }
-                        }
-                        // A fill push can also carry confirmed amended terms.
-                        // Deliver those first so a fill of the enlarged order is
-                        // not rejected against the old quantity in the engine.
-                        let terms = if matches!(&event, ParsedOrderEvent::Fill(_))
+                            .ok()
+                            .map(ParsedOrderEvent::Updated)
+                        } else if matches!(&event, ParsedOrderEvent::Fill(_))
                             && previous_state.as_ref().is_some_and(|previous| {
-                                parse_millisecond_timestamp(msg.u_time) > previous.ts_event
+                                parse_millisecond_timestamp(msg.u_time) >= previous.ts_event
                             })
-                            && parse_quantity(&msg.sz, size_precision)
-                                .ok()
-                                .zip(
-                                    parse_quantity(
-                                        msg.acc_fill_sz.as_deref().unwrap_or("0"),
-                                        size_precision,
-                                    )
-                                    .ok(),
-                                )
-                                .is_some_and(|(quantity, filled)| quantity >= filled)
                         {
+                            // A fill row may also confirm changed terms at the same
+                            // millisecond. Compare terms; time equality is not identity.
                             let mut terms_msg = msg.clone();
                             terms_msg.state = OKXOrderStatus::Live;
                             terms_msg.fill_sz = "0".into();
                             terms_msg.trade_id.clear();
                             terms_msg.acc_fill_sz = None;
-                            parse_order_event(
+                            match parse_order_event(
                                 &terms_msg,
                                 canonical_client_id,
                                 self.account_id,
@@ -1887,18 +1873,78 @@ impl OKXWsFeedHandler {
                                 previous_filled_qty,
                                 previous_state.as_ref(),
                                 ts_init,
-                            )
-                            .ok()
+                            ) {
+                                Ok(updated @ ParsedOrderEvent::Updated(_)) => Some(updated),
+                                _ => None,
+                            }
                         } else {
                             None
                         };
-                        if let Some(ParsedOrderEvent::Updated(updated)) = terms {
-                            let mut terms_observation = observation.clone();
-                            terms_observation.outcome = "updated_forwarded".into();
-                            terms_observation.event_id = Some(updated.event_id.to_string());
-                            terms_observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+                        let mut events = Vec::with_capacity(2);
+                        if matches!(&event, ParsedOrderEvent::Accepted(_)) {
+                            events.push(event);
+                            events.extend(terms);
+                        } else {
+                            // Queue confirmed terms before the associated fill report.
+                            events.extend(terms);
+                            events.push(event);
+                        }
+                        for event in events {
+                            let mut event_observation = observation.clone();
+                            if let ParsedOrderEvent::Updated(updated) = &event {
+                                let filled = previous_filled_qty
+                                    .unwrap_or_else(|| Quantity::zero(size_precision));
+                                let reported_filled = parse_quantity(
+                                    msg.acc_fill_sz.as_deref().unwrap_or("0"),
+                                    size_precision,
+                                )
+                                .ok();
+                                if updated.quantity < filled
+                                    || reported_filled.is_some_and(|qty| updated.quantity < qty)
+                                {
+                                    event_observation.outcome = "below_filled".into();
+                                    self.emit_request_observation(event_observation);
+                                    continue;
+                                }
+                                if previous_state
+                                    .as_ref()
+                                    .is_some_and(|previous| updated.ts_event < previous.ts_event)
+                                {
+                                    event_observation.outcome = "stale_or_duplicate".into();
+                                    self.emit_request_observation(event_observation);
+                                    continue;
+                                }
+                            }
+                            let (outcome, event_id) = match &event {
+                                ParsedOrderEvent::Accepted(e)
+                                    if !self.emitted_accepted.contains(&e.venue_order_id) =>
+                                {
+                                    ("accepted_forwarded", Some(e.event_id.to_string()))
+                                }
+                                ParsedOrderEvent::Accepted(_) => {
+                                    ("duplicate_accepted_seeded", None)
+                                }
+                                ParsedOrderEvent::Updated(e) => {
+                                    ("updated_forwarded", Some(e.event_id.to_string()))
+                                }
+                                ParsedOrderEvent::Canceled(e) => {
+                                    ("canceled_forwarded", Some(e.event_id.to_string()))
+                                }
+                                ParsedOrderEvent::Expired(e) => {
+                                    ("expired_forwarded", Some(e.event_id.to_string()))
+                                }
+                                ParsedOrderEvent::Triggered(e) => {
+                                    ("triggered_forwarded", Some(e.event_id.to_string()))
+                                }
+                                ParsedOrderEvent::Fill(_) => ("fill_report_forwarded", None),
+                                ParsedOrderEvent::StatusOnly(_) => {
+                                    ("status_report_forwarded", None)
+                                }
+                            };
+                            event_observation.outcome = outcome.into();
+                            event_observation.event_id = event_id;
                             self.process_parsed_order_event(
-                                ParsedOrderEvent::Updated(updated),
+                                event,
                                 &msg,
                                 price_precision,
                                 size_precision,
@@ -1906,41 +1952,10 @@ impl OKXWsFeedHandler {
                                 &raw_child,
                                 &mut exec_reports,
                             );
-                            self.emit_request_observation(terms_observation);
+                            event_observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+                            self.emit_request_observation(event_observation);
                         }
-                        let (outcome, event_id) = match &event {
-                            ParsedOrderEvent::Accepted(e)
-                                if !self.emitted_accepted.contains(&e.venue_order_id) =>
-                            {
-                                ("accepted_forwarded", Some(e.event_id.to_string()))
-                            }
-                            ParsedOrderEvent::Accepted(_) => ("duplicate_accepted_seeded", None),
-                            ParsedOrderEvent::Updated(e) => {
-                                ("updated_forwarded", Some(e.event_id.to_string()))
-                            }
-                            ParsedOrderEvent::Canceled(e) => {
-                                ("canceled_forwarded", Some(e.event_id.to_string()))
-                            }
-                            ParsedOrderEvent::Expired(e) => {
-                                ("expired_forwarded", Some(e.event_id.to_string()))
-                            }
-                            ParsedOrderEvent::Triggered(e) => {
-                                ("triggered_forwarded", Some(e.event_id.to_string()))
-                            }
-                            ParsedOrderEvent::Fill(_) => ("fill_report_forwarded", None),
-                            ParsedOrderEvent::StatusOnly(_) => ("status_report_forwarded", None),
-                        };
-                        observation.outcome = outcome.into();
-                        observation.event_id = event_id;
-                        self.process_parsed_order_event(
-                            event,
-                            &msg,
-                            price_precision,
-                            size_precision,
-                            canonical_client_id,
-                            &raw_child,
-                            &mut exec_reports,
-                        );
+                        continue;
                     }
                     Err(e) => {
                         observation.outcome = "parse_error".into();
@@ -3390,7 +3405,10 @@ mod tests {
     }
 
     mod channel_routing {
-        use crate::websocket::{handler::PendingOrderParams, messages::WsPostOrderParams};
+        use crate::websocket::{
+            handler::PendingOrderParams,
+            messages::{ExecutionReport, WsPostOrderParams},
+        };
         use ahash::AHashSet;
         use nautilus_core::nanos::UnixNanos;
         use nautilus_model::{
@@ -3513,6 +3531,10 @@ mod tests {
             let initial =
                 handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(1000u64));
             assert!(matches!(initial, Some(NautilusWsMessage::OrderAccepted(_))));
+            assert!(matches!(
+                handler.pending_messages.pop_front(),
+                Some(NautilusWsMessage::OrderUpdated(_))
+            ));
             let acknowledge = |handler: &mut OKXWsFeedHandler| {
                 assert!(
                     handler
@@ -3624,7 +3646,7 @@ mod tests {
             assert!(handler.order_state_cache.is_empty());
             let initial =
                 handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(1000u64));
-            assert!(initial.is_none());
+            assert!(matches!(initial, Some(NautilusWsMessage::OrderUpdated(_))));
             let acknowledge = |handler: &mut OKXWsFeedHandler| {
                 assert!(
                     handler
@@ -3767,6 +3789,183 @@ mod tests {
                             && item.event_id.is_some())
                 );
             }
+        }
+
+        #[rstest]
+        fn test_first_snapshot_and_tied_terms(
+            #[values(false, true)] first_fill: bool,
+            #[values(false, true)] seeded: bool,
+        ) {
+            let (mut handler, _, _, _) = create_test_handler();
+            let instrument = create_swap_instrument();
+            handler
+                .instruments_cache
+                .insert(instrument.symbol().inner(), instrument);
+            insert_pending_amend(&mut handler, "req-1");
+            let context = handler.pending_amend_requests["req-1"].clone();
+            handler
+                .active_client_orders
+                .insert(context.0, (context.1, context.2, context.3));
+            let params: WsPostOrderParams = serde_json::from_value(serde_json::json!({
+                "instId":"BTC-USDT-SWAP", "tdMode":"cross", "side":"buy",
+                "ordType":"limit", "sz":"1", "px":"100", "clOrdId":"TEST-ORDER"
+            }))
+            .unwrap();
+            handler.pending_place_requests.insert(
+                "place-1".into(),
+                (
+                    PendingOrderParams::Regular(params),
+                    context.0,
+                    context.1,
+                    context.2,
+                    context.3,
+                ),
+            );
+            assert!(matches!(
+                handler.handle_order_response(
+                    Some("place-1".into()),
+                    OKXWsOperation::Order,
+                    "0".into(),
+                    String::new(),
+                    vec![serde_json::json!({"ordId":"12345","sCode":"0"})],
+                    UnixNanos::from(900u64),
+                ),
+                Some(NautilusWsMessage::OrderAccepted(_))
+            ));
+            assert!(handler.order_state_cache.is_empty());
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&load_test_json("ws_orders.json")).unwrap();
+            for (key, value) in [
+                ("clOrdId", "TEST-ORDER"),
+                ("ordId", "12345"),
+                ("state", "live"),
+                ("ordType", "limit"),
+                ("px", "100"),
+                ("sz", "1"),
+                ("accFillSz", "0"),
+                ("fillSz", "0"),
+                ("tradeId", ""),
+                ("fillPx", ""),
+                ("fillTime", ""),
+                ("avgPx", ""),
+                ("fee", "0"),
+                ("cTime", "1000"),
+                ("uTime", "1000"),
+            ] {
+                payload["data"][0][key] = value.into();
+            }
+            if seeded {
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(1000u64));
+                handler.pending_messages.clear();
+            }
+            // A successful amend reply must not establish confirmed terms.
+            assert!(
+                handler
+                    .handle_order_response(
+                        Some("req-1".into()),
+                        OKXWsOperation::AmendOrder,
+                        "0".into(),
+                        String::new(),
+                        vec![serde_json::json!({"ordId":"12345","sCode":"0"})],
+                        UnixNanos::from(2000u64),
+                    )
+                    .is_none()
+            );
+            assert_eq!(handler.order_state_cache.is_empty(), !seeded);
+            payload["data"][0]["sz"] = "2".into();
+            payload["data"][0]["px"] = "110".into();
+            if first_fill {
+                for (key, value) in [
+                    ("state", "partially_filled"),
+                    ("fillSz", "1.5"),
+                    ("accFillSz", "1.5"),
+                    ("fillPx", "110"),
+                    ("tradeId", "77"),
+                    ("fillTime", "1000"),
+                    ("fee", "-1.25"),
+                    ("feeCcy", "USDT"),
+                ] {
+                    payload["data"][0][key] = value.into();
+                }
+            }
+            let Some(NautilusWsMessage::OrderUpdated(updated)) =
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(3000u64))
+            else {
+                panic!(
+                    "confirmed terms must precede the fill even without a seed or at a tied timestamp"
+                );
+            };
+            assert_eq!(updated.reconciliation, 0); // Cannot bypass native terminal guards.
+            #[cfg(feature = "python")]
+            {
+                use pyo3::prelude::*;
+                Python::initialize();
+                Python::attach(|py| {
+                    let expected_id = updated.event_id.to_string();
+                    let object = updated.into_pyobject(py).unwrap();
+                    let values = object.call_method0("to_dict").unwrap();
+                    assert_eq!(
+                        values
+                            .get_item("event_id")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap(),
+                        expected_id
+                    );
+                    assert_eq!(
+                        values
+                            .get_item("reconciliation")
+                            .unwrap()
+                            .extract::<u8>()
+                            .unwrap(),
+                        0
+                    );
+                });
+            }
+            assert_eq!(updated.quantity, Quantity::from("2"));
+            assert_eq!(updated.price.unwrap(), Price::from("110"));
+            assert_eq!(updated.ts_event, UnixNanos::from(1_000_000_000u64));
+            if first_fill {
+                let Some(NautilusWsMessage::ExecutionReports(reports)) =
+                    handler.pending_messages.pop_front()
+                else {
+                    panic!("missing fill after terms");
+                };
+                let ExecutionReport::Fill(fill) = &reports[0] else {
+                    panic!("not a fill");
+                };
+                assert_eq!(fill.last_qty, Quantity::from("1.5"));
+                assert_eq!(fill.commission, Money::from("1.25 USDT"));
+            }
+            assert!(handler.pending_messages.is_empty());
+            // Replayed fills retain their trade identity for native deduplication;
+            // they must not emit another terms event.
+            let repeated =
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(4000u64));
+            if first_fill {
+                let Some(NautilusWsMessage::ExecutionReports(reports)) = repeated else {
+                    panic!("missing replay report");
+                };
+                let ExecutionReport::Fill(fill) = &reports[0] else {
+                    panic!("not a replay fill");
+                };
+                assert_eq!(fill.trade_id.to_string(), "77");
+            } else {
+                assert!(repeated.is_none());
+            }
+            // Older changed terms remain fenced.
+            payload["data"][0]["state"] = "live".into();
+            payload["data"][0]["sz"] = "3".into();
+            payload["data"][0]["uTime"] = "999".into();
+            assert!(
+                handler
+                    .handle_orders_data(payload["data"].clone(), UnixNanos::from(5000u64))
+                    .is_none()
+            );
+            assert_eq!(
+                handler.order_state_cache[&context.0].quantity,
+                Quantity::from("2")
+            );
         }
 
         #[rstest]

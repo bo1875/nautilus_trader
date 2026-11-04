@@ -48,6 +48,7 @@ from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
 from nautilus_trader.model.enums import TriggerType
+from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -1506,6 +1507,197 @@ class TestLiveExecutionEngine:
         assert order.status == OrderStatus.PENDING_UPDATE
         assert order.quantity == Quantity.from_int(120)
 
+    def _accepted_terms_order(self):
+        o = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        o.apply(TestEventStubs.order_submitted(o))
+        o.apply(TestEventStubs.order_accepted(o))
+        self.cache.add_order(o)
+        return o
+
+    @pytest.mark.parametrize("same_timestamp", [True, False])
+    def test_report_terms_after_fill(self, same_timestamp):
+        o = self._accepted_terms_order()
+        fill = TestEventStubs.order_filled(
+            o, instrument=AUDUSD_SIM, last_qty=Quantity.from_int(20), ts_event=1000000
+        )
+        self.exec_engine._handle_event_with_tracking(fill)
+        report = OrderStatusReport(
+            account_id=o.account_id,
+            instrument_id=o.instrument_id,
+            client_order_id=o.client_order_id,
+            venue_order_id=o.venue_order_id,
+            order_side=o.side,
+            order_type=o.order_type,
+            time_in_force=o.time_in_force,
+            order_status=OrderStatus.ACCEPTED,
+            quantity=Quantity.from_int(120),
+            filled_qty=o.filled_qty,
+            price=Price.from_str("1.10000"),
+            report_id=UUID4(),
+            ts_accepted=1,
+            ts_last=1000000 + (0 if same_timestamp else 1000000),
+            ts_init=0,
+        )
+        assert self.exec_engine.reconcile_execution_report(report)
+        assert o.quantity == report.quantity
+        assert o.price == report.price
+        assert o.filled_qty == Quantity.from_int(20)
+        assert o.status == OrderStatus.PARTIALLY_FILLED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("intervening", [True, False])
+    async def test_duplicate_update_does_not_resolve_new_pending(self, intervening):
+        o = self._accepted_terms_order()
+        updated = TestEventStubs.order_updated(o, quantity=Quantity.from_int(120), ts_event=1000000)
+        self.exec_engine.process(updated)
+        await eventually(lambda: o.quantity == Quantity.from_int(120))
+        if intervening:
+            self.exec_engine.process(TestEventStubs.order_pending_update(o))
+            await eventually(lambda: o.status == OrderStatus.PENDING_UPDATE)
+        count = o.event_count
+        status = o.status
+        rows = []
+        self.msgbus.subscribe("execution.order_apply_observation", rows.append)
+        self.exec_engine.process(updated)
+        await eventually(lambda: bool(rows))
+        assert rows[-1].outcome == "duplicate"
+        assert o.event_count == count
+        assert o.status == status
+
+    @pytest.mark.asyncio
+    async def test_first_confirmed_snapshot_preserves_unchanged_pending_terms(self):
+        order = self._accepted_terms_order()
+        self.exec_engine.process(TestEventStubs.order_pending_update(order))
+        await eventually(lambda: order.status == OrderStatus.PENDING_UPDATE)
+        count = order.event_count
+        observations = []
+        self.msgbus.subscribe("execution.order_apply_observation", observations.append)
+        values = OrderUpdated.to_dict(
+            TestEventStubs.order_updated(order, price=order.price, ts_event=100)
+        )
+        snapshot = OrderUpdated.from_dict(values)
+        self.exec_engine.process(snapshot)
+        await eventually(lambda: bool(observations))
+        assert observations[-1].event_id == str(snapshot.id)
+        assert observations[-1].outcome == "unchanged"
+        assert order.event_count == count
+        assert order.status == OrderStatus.PENDING_UPDATE
+        # Distinct authoritative terms at the same millisecond can still apply.
+        values["event_id"] = str(UUID4())
+        values["quantity"] = "120"
+        changed = OrderUpdated.from_dict(values)
+        self.exec_engine.process(changed)
+        await eventually(lambda: len(observations) == 2)
+        assert observations[-1].outcome == "applied"
+        assert observations[-1].event_id == str(changed.id)
+        assert order.quantity == Quantity.from_int(120)
+        assert order.status == OrderStatus.ACCEPTED
+
+    def test_canceled_reconciliation_terms_precede_real_late_fill(self):
+        order = self._accepted_terms_order()
+        self.exec_engine._handle_event_with_tracking(
+            TestEventStubs.order_filled(
+                order,
+                instrument=AUDUSD_SIM,
+                last_qty=Quantity.from_int(20),
+                ts_event=100,
+                commission=Money(0, USD),
+            )
+        )
+        self.exec_engine._handle_event_with_tracking(TestEventStubs.order_canceled(order))
+        report = OrderStatusReport(
+            account_id=order.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.PARTIALLY_FILLED,
+            quantity=Quantity.from_int(150),
+            filled_qty=Quantity.from_int(120),
+            price=order.price,
+            avg_px=Decimal("1.00000"),
+            report_id=UUID4(),
+            ts_accepted=1,
+            ts_last=200,
+            ts_init=0,
+        )
+        fill = FillReport(
+            account_id=order.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            trade_id=TradeId("LATE-FILL"),
+            order_side=order.side,
+            last_qty=Quantity.from_int(100),
+            last_px=order.price,
+            commission=Money(1.25, USD),
+            liquidity_side=LiquiditySide.MAKER,
+            report_id=UUID4(),
+            ts_event=200,
+            ts_init=0,
+        )
+        states = []
+        self.msgbus.subscribe(
+            "execution.order_apply_observation", lambda _: states.append(order.status)
+        )
+        assert self.exec_engine._reconcile_order_report(report, [fill])
+        assert states == [OrderStatus.CANCELED]  # Terms alone cannot reopen it.
+        assert order.quantity == Quantity.from_int(150)
+        assert order.filled_qty == Quantity.from_int(120)
+        assert order.commissions() == [Money(1.25, USD)]
+        count = order.event_count
+        assert self.exec_engine._reconcile_order_report(report, [fill])
+        assert order.event_count == count
+        assert order.filled_qty == Quantity.from_int(120)
+        assert order.commissions() == [Money(1.25, USD)]
+
+    @pytest.mark.parametrize("reconciliation", [False, True])
+    @pytest.mark.parametrize("terminal", ["canceled", "expired", "filled"])
+    def test_terminal_term_correction_is_limited_to_canceled_reconciliation(
+        self, reconciliation, terminal
+    ):
+        order = self._accepted_terms_order()
+        if terminal == "filled":
+            event = TestEventStubs.order_filled(order, instrument=AUDUSD_SIM, ts_event=100)
+        else:
+            event = getattr(TestEventStubs, "order_" + terminal)(order)
+        self.exec_engine._handle_event_with_tracking(event)
+        status = order.status
+        values = OrderUpdated.to_dict(
+            TestEventStubs.order_updated(
+                order,
+                quantity=Quantity.from_int(150),
+                price=order.price,
+                ts_event=200,
+            )
+        )
+        values["reconciliation"] = reconciliation
+        updated = OrderUpdated.from_dict(values)
+        rows = []
+        self.msgbus.subscribe("execution.order_apply_observation", rows.append)
+        self.exec_engine._handle_event_with_tracking(updated)
+        allowed = terminal == "canceled" and reconciliation
+        assert rows[-1].outcome == ("applied" if allowed else "terminal")
+        assert order.quantity == Quantity.from_int(150 if allowed else 100)
+        assert order.status == status
+        if allowed:
+            self.exec_engine._handle_event_with_tracking(updated)
+            assert rows[-1].outcome == "duplicate"
+            values["event_id"] = str(UUID4())
+            values["ts_event"] = 199
+            values["quantity"] = "160"
+            self.exec_engine._handle_event_with_tracking(OrderUpdated.from_dict(values))
+            assert rows[-1].outcome == "stale"
+            assert order.quantity == Quantity.from_int(150)
+            assert order.status == status
+
     def test_confirmed_terms_preserve_fills_terminal_and_apply_observations(self):
         order = self.order_factory.limit(
             instrument_id=AUDUSD_SIM.id,
@@ -1565,7 +1757,7 @@ class TestLiveExecutionEngine:
         report.ts_last += 1
         assert self.exec_engine.reconcile_execution_report(report)
         self.exec_engine._handle_event_with_tracking(updated)
-        assert observations[-1].outcome == "terminal"
+        assert observations[-1].outcome == "duplicate"
         assert order.event_count == count
         assert order.status == OrderStatus.CANCELED
 

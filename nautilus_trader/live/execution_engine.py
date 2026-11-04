@@ -3204,7 +3204,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 return True
             if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
                 self._generate_order_accepted(order, report)
-            if self._should_update(order, report) and report.ts_last > confirmed_ts:
+            if self._should_update(order, report):
                 self._generate_order_updated(order, report)
             return True
 
@@ -3644,7 +3644,9 @@ class LiveExecutionEngine(ExecutionEngine):
 
     def _handle_event_with_tracking(self, event: OrderEvent) -> None:
         # Validate terms again at application: a fill or terminal event may have
-        # reached the engine after the adapter produced this update.
+        # reached the engine after the adapter produced this update. Authoritative
+        # reconciliation can correct a canceled order before real late fills;
+        # applying terms alone leaves it canceled. Websocket updates cannot do this.
         before_id = None
         if isinstance(event, OrderUpdated):
             order = self._cache.order(event.client_order_id)
@@ -3659,14 +3661,28 @@ class LiveExecutionEngine(ExecutionEngine):
                     default=0,
                 )
                 reason = None
-                if order.is_closed:
+                if order.is_closed and not (
+                    order.status == OrderStatus.CANCELED and event.reconciliation
+                ):
                     reason = "terminal"
                 elif event.quantity < order.filled_qty:
                     reason = "below_filled"
+                elif any(item.id == event.id for item in order.events):
+                    reason = "duplicate"
                 elif event.ts_event < confirmed_ts:
                     reason = "stale"
-                elif before_id == event.id:
-                    reason = "duplicate"
+                elif (
+                    event.quantity == order.quantity
+                    and (event.venue_order_id is None or event.venue_order_id == order.venue_order_id)
+                    and (event.price is None or (order.has_price and event.price == order.price))
+                    and (
+                        event.trigger_price is None
+                        or (order.has_trigger_price and event.trigger_price == order.trigger_price)
+                    )
+                ):
+                    # A first authoritative snapshot may repeat the cached terms.
+                    # It is not confirmation of a newer pending operation.
+                    reason = "unchanged"
                 if reason is not None:
                     self._observe_order_apply(event, reason)
                     return
