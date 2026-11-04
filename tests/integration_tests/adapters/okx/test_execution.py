@@ -1941,9 +1941,11 @@ async def test_targeted_algo_fallback_preserves_failure(
         [_order_report(other, client.account_id).to_pyo3()],
         [],
     )
-    http.request_algo_order_status_report = AsyncMock(return_value=None)
+    http.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
     if failure:
-        http.request_algo_order_status_report.side_effect = TimeoutError("Synthetic read timeout")
+        http.request_algo_order_status_reports_with_errors.side_effect = TimeoutError(
+            "Synthetic read timeout"
+        )
     command = GenerateOrderStatusReport(
         instrument_id=instrument.id,
         client_order_id=ClientOrderId("O-1"),
@@ -2159,16 +2161,16 @@ async def test_known_algo_resolution_does_not_depend_on_regular_orders(
         other_report.venue_order_id = VenueOrderId("9002")
         rows = [other_report.to_pyo3()]
     http.request_order_status_reports_with_errors.return_value = (rows, [])
-    http.request_algo_order_status_report = AsyncMock(
-        return_value=report.to_pyo3() if outcome == "client_match" else None,
-    )
-    http.request_algo_order_status_reports = AsyncMock(
-        return_value=[report.to_pyo3()] if outcome == "algo_match" else [],
-    )
-    if outcome == "error":
-        http.request_algo_order_status_reports.side_effect = TimeoutError(
-            "Synthetic algo read failure"
+
+    async def algo_read(**kwargs):
+        if outcome == "error":
+            raise TimeoutError("Synthetic algo read failure")
+        matched = (outcome == "client_match" and kwargs["algo_client_order_id"] is not None) or (
+            outcome == "algo_match" and kwargs["algo_id"] == "9001"
         )
+        return ([report.to_pyo3()] if matched else [], [])
+
+    http.request_algo_order_status_reports_with_errors = AsyncMock(side_effect=algo_read)
     engine = LiveExecutionEngine(
         loop=asyncio.get_running_loop(),
         msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
@@ -2195,6 +2197,94 @@ async def test_known_algo_resolution_does_not_depend_on_regular_orders(
             assert order.events == before
         else:
             assert order.status == OrderStatus.ACCEPTED
-        http.request_algo_order_status_report.assert_awaited()
+        http.request_algo_order_status_reports_with_errors.assert_awaited()
     finally:
         engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("positive_route", ["targeted_incomplete", "bulk_incomplete"])
+async def test_retained_positive_on_other_targeted_query(
+    exec_client_builder, monkeypatch, instrument, cache, live_clock, caller, positive_route
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    cache.add_instrument(instrument)
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(),
+        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
+        cache=cache,
+        clock=live_clock,
+        config=LiveExecEngineConfig(
+            open_check_open_only=False, open_check_threshold_ms=0, single_order_query_delay_ms=0
+        ),
+    )
+    engine.register_client(client)
+    b = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-B"))
+    cache.add_order(b, client_id=client.id)
+    b.apply(TestEventStubs.order_submitted(b, account_id=client.account_id, ts_event=0))
+    if caller == "periodic":
+        b.apply(
+            TestEventStubs.order_accepted(
+                b, account_id=client.account_id, venue_order_id=VenueOrderId("B"), ts_event=0
+            )
+        )
+    cache.update_order(b)
+    engine._recon_check_retries[b.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def read(**kwargs):
+        nonlocal calls
+        calls += 1
+        # Initial periodic bulk pass has no positive observation.
+        if caller == "periodic" and calls == 1:
+            return [], []
+        entered.set()
+        await release.wait()
+        return [], []
+
+    http.request_order_status_reports_with_errors.side_effect = read
+    http.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
+    task = asyncio.create_task(
+        engine._check_orders_consistency()
+        if caller == "periodic"
+        else engine._check_inflight_orders()
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    a = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-A"))
+    cache.add_order(a, client_id=client.id)
+    a.apply(TestEventStubs.order_submitted(a, account_id=client.account_id, ts_event=0))
+    a.apply(
+        TestEventStubs.order_accepted(
+            a, account_id=client.account_id, venue_order_id=VenueOrderId("A"), ts_event=0
+        )
+    )
+    cache.update_order(a)
+    positive = _order_report(b, client.account_id)
+    positive.venue_order_id = VenueOrderId("B")
+    http.request_order_status_reports_with_errors.side_effect = None
+    http.request_order_status_reports_with_errors.return_value = (
+        [positive.to_pyo3()],
+        ["synthetic unrelated row conversion failure"],
+    )
+    try:
+        if positive_route == "targeted_incomplete":
+            # Actual engine caller receives IncompleteOrderStatusReports([positive B])
+            # from actual OKX targeted lookup of A.
+            await engine._resolve_order_not_found_at_venue(a)
+        else:
+            await engine._check_orders_consistency()
+        assert not a.is_closed
+    finally:
+        release.set()
+        await task
+        engine.dispose()
+    assert not engine._pending_absence_queries
+    assert not b.is_closed, (
+        "Retained positive B received during its older query must invalidate that absence decision"
+    )

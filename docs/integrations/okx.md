@@ -390,9 +390,22 @@ incomplete query. Without a match it raises; it returns `None` only after a succ
 negative query within the existing endpoint and history scope. Algo fallback failures
 also propagate. A regular query with no matching order still checks the requested client
 identity through the algo fallback, even when the regular result is empty. This changes
-the previous error-to-empty/error-to-None behavior; wrappers
-must retain unresolved state on exceptions. It uses the existing Rust
-`request_order_status_reports_with_errors` contract and requires no new binary API.
+the previous error-to-empty/error-to-None behavior; wrappers must retain unresolved state
+on exceptions. Regular queries use `request_order_status_reports_with_errors`.
+
+Algo queries require the additive Rust/PyO3
+`request_algo_order_status_reports_with_errors` method. It accepts the same filters as
+`request_algo_order_status_reports` and returns `(reports, errors)`. Only `([], [])`
+establishes a complete negative within the requested endpoint scope. Conversion, cache,
+endpoint and saturated-page failures retain usable observations with nonempty errors;
+rows outside the requested filters do not count as failures. The adapter checks both
+client identifiers and known algo identifiers, returns a matching positive even if
+another branch failed, and raises `IncompleteOrderStatusReports` when unmatched coverage
+is incomplete. Cancellation
+propagates. A missing strict method on an older binary raises rather than falling back
+to an empty result, so this Python adapter requires a binary built with the new method.
+The legacy algo list and singular methods keep their return types but now raise on
+incomplete reads instead of silently omitting rows.
 
 Fill and position readers also use the existing strict Rust report methods and propagate
 failures. The optional SPOT wallet reader propagates query and conversion failures;
@@ -408,7 +421,8 @@ resolving an order. Failed reads, failed local application, missing clients, and
 activity during that query leave the order unresolved. Matching positive order/fill report
 receipt also invalidates outstanding absence queries before application, including when
 application is a no-op or fails. This covers individual reports and complete/incomplete
-collections; it retains only active query tokens, not a history of observations. A later
+collections, including positives retained by a failed targeted query for another order.
+It retains only active query tokens, not a history of observations. A later
 query can still establish qualified absence. Retry and timer settings remain unchanged.
 
 ### Contingent orders

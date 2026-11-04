@@ -7889,6 +7889,16 @@ class OKXHttpClient:
         state: OKXOrderStatus | None = None,
         limit: int | None = None,
     ) -> list[OrderStatusReport]: ...
+    async def request_algo_order_status_reports_with_errors(
+        self,
+        account_id: AccountId,
+        instrument_type: OKXInstrumentType | None = None,
+        instrument_id: InstrumentId | None = None,
+        algo_id: str | None = None,
+        algo_client_order_id: ClientOrderId | None = None,
+        state: OKXOrderStatus | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[OrderStatusReport], list[str]]: ...
     async def request_algo_order_status_report(
         self,
         account_id: AccountId,

@@ -1463,6 +1463,10 @@ class LiveExecutionEngine(ExecutionEngine):
                     phase = "reconcile"
                     self._reconcile_order_report(report, trades=[])
                     return False  # A positive report cannot establish absence.
+            except IncompleteOrderStatusReports as e:
+                for report in e.reports:
+                    self._record_order_report_receipt(report)
+                return False
             except Exception as e:
                 self._log.warning(
                     f"Targeted order resolution unresolved for {order.client_order_id!r}: "

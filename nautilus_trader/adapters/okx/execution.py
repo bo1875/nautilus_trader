@@ -535,25 +535,33 @@ class OKXExecutionClient(LiveExecutionClient):
             if candidate is not None and candidate not in fallback_ids:
                 fallback_ids.append(candidate)
 
-        algo_ids: set[str] = set()
-        for candidate in fallback_ids:
-            candidate_report = await self._fetch_algo_order_status_report(
-                candidate,
-                pyo3_instrument_id,
-            )
+        algo_ids = {
+            self._algo_order_ids[candidate]
+            for candidate in fallback_ids
+            if candidate in self._algo_order_ids
+        }
+        queries: list[tuple[ClientOrderId | None, str | None]] = [
+            (candidate, None) for candidate in fallback_ids
+        ]
+        queries.extend((None, algo_id) for algo_id in sorted(algo_ids))
+        incomplete_reports: list[OrderStatusReport] = []
+        incomplete = False
+        for candidate, algo_id in queries:
+            try:
+                candidate_report = await self._fetch_algo_order_status_report(
+                    candidate,
+                    pyo3_instrument_id,
+                    algo_id=algo_id,
+                )
+            except IncompleteOrderStatusReports as e:
+                incomplete = True
+                incomplete_reports.extend(e.reports)
+                continue
             if candidate_report is not None:
                 return candidate_report
-            algo_id = self._algo_order_ids.get(candidate)
-            if algo_id is not None:
-                algo_ids.add(algo_id)
 
-        for algo_id in algo_ids:
-            candidate_report = await self._fetch_algo_order_status_report_by_algo_id(
-                algo_id,
-                pyo3_instrument_id,
-            )
-            if candidate_report is not None:
-                return candidate_report
+        if incomplete:
+            raise IncompleteOrderStatusReports(incomplete_reports)
 
         exchange_client_order_id = self._exchange_client_order_id(command.client_order_id)
         algo_ids_repr = sorted(algo_ids) if algo_ids else None
@@ -567,53 +575,45 @@ class OKXExecutionClient(LiveExecutionClient):
 
     async def _fetch_algo_order_status_report(
         self,
-        query_client_order_id: ClientOrderId,
+        query_client_order_id: ClientOrderId | None,
         pyo3_instrument_id: nautilus_pyo3.InstrumentId,
+        *,
+        algo_id: str | None = None,
     ) -> OrderStatusReport | None:
-        try:
-            pyo3_client_order_id = nautilus_pyo3.ClientOrderId(
-                query_client_order_id.value,
-            )
-            algo_report = await self._http_client.request_algo_order_status_report(
-                account_id=self.pyo3_account_id,
-                instrument_id=pyo3_instrument_id,
-                client_order_id=pyo3_client_order_id,
-            )
-            if algo_report is None:
-                return None
-
-            report = OrderStatusReport.from_pyo3(algo_report)
-            self._apply_client_order_alias(report)
-            self._log.debug(
-                f"Resolved OKX algo order status via fallback for {query_client_order_id!r}",
-            )
-            return report
-        except Exception as e:
-            self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
-            raise
-
-    async def _fetch_algo_order_status_report_by_algo_id(
-        self,
-        algo_id: str,
-        pyo3_instrument_id: nautilus_pyo3.InstrumentId,
-    ) -> OrderStatusReport | None:
-        try:
-            algo_reports = await self._http_client.request_algo_order_status_reports(
-                account_id=self.pyo3_account_id,
-                instrument_id=pyo3_instrument_id,
-                algo_id=algo_id,
-            )
-            for algo_report in algo_reports:
+        reports: list[OrderStatusReport] = []
+        # Missing strict methods on an older binary raise; never substitute an empty read.
+        (
+            algo_reports,
+            errors,
+        ) = await self._http_client.request_algo_order_status_reports_with_errors(
+            account_id=self.pyo3_account_id,
+            instrument_id=pyo3_instrument_id,
+            algo_id=algo_id,
+            algo_client_order_id=(
+                nautilus_pyo3.ClientOrderId(query_client_order_id.value)
+                if query_client_order_id is not None
+                else None
+            ),
+        )
+        incomplete = bool(errors)
+        for algo_report in algo_reports:
+            try:
                 report = OrderStatusReport.from_pyo3(algo_report)
                 self._apply_client_order_alias(report)
-                self._log.debug(
-                    f"Resolved OKX algo order status via algo_id={algo_id}",
-                )
-                return report
-        except Exception as e:
-            self._log.exception("Failed to query OKX algo order by algo_id", e)
-            raise
+                reports.append(report)
+            except Exception:
+                incomplete = True
 
+        for report in reports:
+            if (
+                query_client_order_id is not None
+                and self._canonical_client_order_id(report.client_order_id)
+                == self._canonical_client_order_id(query_client_order_id)
+            ) or (algo_id is not None and report.venue_order_id.value == algo_id):
+                return report
+
+        if incomplete:
+            raise IncompleteOrderStatusReports(reports)
         return None
 
     async def generate_fill_reports(

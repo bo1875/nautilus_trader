@@ -190,6 +190,7 @@ def mock_http_client():
 
     mock.request_order_status_reports = AsyncMock(return_value=[])
     mock.request_order_status_reports_with_errors = AsyncMock(return_value=([], []))
+    mock.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
     mock.request_fill_reports = AsyncMock(return_value=[])
     mock.request_fill_reports_with_errors = AsyncMock(return_value=([], []))
     mock.request_position_status_reports = AsyncMock(return_value=[])
