@@ -1,15 +1,15 @@
-name: PT public wheel
+name: Public maintenance wheel
 
 on:
   pull_request:
-    branches: [pt-1.224.0]
+    branches: [maintenance/1.224.0]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pt-wheel-${{ github.ref }}
+  group: public-wheel-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -65,7 +65,7 @@ jobs:
           cp -r fork_tests /tmp/native-contracts/
           cd /tmp/native-contracts
           export PYTHONPATH="$PWD"
-          /tmp/qualification/bin/python -I -c 'from importlib.metadata import version; import nautilus_trader as n; from nautilus_trader.core import nautilus_pyo3 as r; assert version("nautilus_trader") == n.__version__ == r.NAUTILUS_VERSION == "1.224.0+pt.fork.1"; assert n.__file__.startswith("/tmp/qualification/")'
+          /tmp/qualification/bin/python -I -c 'from importlib.metadata import version; import nautilus_trader as n; from nautilus_trader.core import nautilus_pyo3 as r; assert version("nautilus_trader") == n.__version__ == r.NAUTILUS_VERSION == "1.224.0+fork.1"; assert n.__file__.startswith("/tmp/qualification/")'
           /tmp/qualification/bin/python -m pytest -q -p no:cacheprovider --runxfail -c /dev/null fork_tests --junitxml=/tmp/public-wheels/native-tests.xml
           /tmp/qualification/bin/python -m pip freeze > /tmp/public-wheels/installed-packages.txt
       - name: Record source and compiler identity
@@ -78,7 +78,7 @@ jobs:
       - name: Retain candidate artifacts for application qualification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nautilus-pt-linux-cp312
+          name: nautilus-fork-linux-cp312
           path: /tmp/public-wheels/
           if-no-files-found: error
           retention-days: 30

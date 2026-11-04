@@ -131,7 +131,7 @@ assert len(errors) == 1 and errors[0].endswith(':report:conversion')
 @GAP
 def test_spot_market_quote_underflow_is_rejected_with_valid_controls():
     from pathlib import Path
-    script = Path(__file__).with_name('g4s-round2-quote-probe.py')
+    script = Path(__file__).with_name('quote_conversion_probe.py')
     result = subprocess.run([sys.executable, str(script)], text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr[-1200:]
     observations = json.loads(result.stdout)
