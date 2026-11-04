@@ -1,4 +1,4 @@
-"""Synthetic contract for a separately built candidate, never G5's current wheel.
+"""Synthetic contracts for the installed reported-CASH candidate.
 
 Without the candidate, changed contracts are strict expected failures. Run with
 --runxfail after an explicitly authorized build. No test makes venue calls.
@@ -302,8 +302,7 @@ def test_existing_native_risk_scope_does_not_promise_cash_checks_on_amends(actio
             order.client_order_id, order.venue_order_id, inst.make_qty('100'),
             inst.make_price('100'), None, UUID4(), 1)
     risk.execute(command)
-    # This is a characterization, not desired financial behavior. The PT
-    # command owner must still enforce final cash admission on both paths.
+    # Characterize the existing difference between native submit and modify checks.
     if action == 'submit':
         assert not sent and len(events) == 1
         assert 'NOTIONAL_EXCEEDS_FREE_BALANCE' in events[0].reason

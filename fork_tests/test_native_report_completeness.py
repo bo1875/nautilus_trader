@@ -74,7 +74,7 @@ async def observe(kind, rows, *, strict=True, history=None, status=200, **kwargs
         assert requests.count(PATHS[kind]) == 1
         if strict and HAS_CAPABILITY:
             return result
-        return result, []  # Exposes the legacy false-success defect, never used in PT.
+        return result, []  # Exposes the legacy false-success defect for comparison.
 
 
 @pytest.mark.parametrize('kind', METHODS)
