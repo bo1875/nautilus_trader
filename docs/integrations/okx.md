@@ -388,7 +388,9 @@ from this list. Cancellation propagates as `asyncio.CancelledError`.
 `generate_order_status_report` may return a matching positive observation from an
 incomplete query. Without a match it raises; it returns `None` only after a successful
 negative query within the existing endpoint and history scope. Algo fallback failures
-also propagate. This changes the previous error-to-empty/error-to-None behavior; wrappers
+also propagate. A regular query with no matching order still checks the requested client
+identity through the algo fallback, even when the regular result is empty. This changes
+the previous error-to-empty/error-to-None behavior; wrappers
 must retain unresolved state on exceptions. It uses the existing Rust
 `request_order_status_reports_with_errors` contract and requires no new binary API.
 
@@ -403,8 +405,11 @@ propagates cancellation. An overlapping successful call cannot certify a failed 
 The live engine applies positive bulk observations while skipping absence checks for an
 incomplete cycle. At the inflight retry limit it performs a final targeted query before
 resolving an order. Failed reads, failed local application, missing clients, and local
-activity during that query leave the order unresolved. Retry and timer settings remain
-unchanged.
+activity during that query leave the order unresolved. Matching positive order/fill report
+receipt also invalidates outstanding absence queries before application, including when
+application is a no-op or fails. This covers individual reports and complete/incomplete
+collections; it retains only active query tokens, not a history of observations. A later
+query can still establish qualified absence. Retry and timer settings remain unchanged.
 
 ### Contingent orders
 

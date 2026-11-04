@@ -2096,3 +2096,105 @@ async def test_wallet_qualified_zero_remains_flat(
     reports = await client.generate_position_status_reports(command)
     assert len(reports) == 1
     assert reports[0].quantity == Quantity.zero(instrument.size_precision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("regular_rows", ["empty", "unrelated"])
+@pytest.mark.parametrize("outcome", ["client_match", "algo_match", "error", "absent"])
+async def test_known_algo_resolution_does_not_depend_on_regular_orders(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    live_clock,
+    caller,
+    regular_rows,
+    outcome,
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-ALGO"),
+        order_side=OrderSide.SELL,
+        quantity=instrument.make_qty(1),
+        trigger_price=instrument.make_price(100),
+        trigger_type=TriggerType.LAST_PRICE,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    cache.add_order(order, client_id=client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id, ts_event=0))
+    if caller == "periodic":
+        order.apply(TestEventStubs.order_accepted(order, account_id=client.account_id, ts_event=0))
+    cache.update_order(order)
+    before = list(order.events)
+    client._algo_order_ids[order.client_order_id] = "9001"
+    report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("9001"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        quantity=order.quantity,
+        filled_qty=Quantity.zero(instrument.size_precision),
+        trigger_price=order.trigger_price,
+        trigger_type=TriggerType.LAST_PRICE,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+    rows = []
+    if regular_rows == "unrelated":
+        other = TestExecStubs.limit_order(
+            instrument=instrument, client_order_id=ClientOrderId("O-OTHER")
+        )
+        other_report = _order_report(other, client.account_id)
+        other_report.venue_order_id = VenueOrderId("9002")
+        rows = [other_report.to_pyo3()]
+    http.request_order_status_reports_with_errors.return_value = (rows, [])
+    http.request_algo_order_status_report = AsyncMock(
+        return_value=report.to_pyo3() if outcome == "client_match" else None,
+    )
+    http.request_algo_order_status_reports = AsyncMock(
+        return_value=[report.to_pyo3()] if outcome == "algo_match" else [],
+    )
+    if outcome == "error":
+        http.request_algo_order_status_reports.side_effect = TimeoutError(
+            "Synthetic algo read failure"
+        )
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(),
+        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
+        cache=cache,
+        clock=live_clock,
+        config=LiveExecEngineConfig(
+            open_check_open_only=False, open_check_threshold_ms=0, single_order_query_delay_ms=0
+        ),
+    )
+    engine.register_client(client)
+    engine._recon_check_retries[order.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    try:
+        if caller == "periodic":
+            await engine._check_orders_consistency()
+        else:
+            await engine._check_inflight_orders()
+        if outcome == "absent":
+            assert order.status == OrderStatus.REJECTED
+        elif outcome == "error":
+            assert order.events == before
+        else:
+            assert order.status == OrderStatus.ACCEPTED
+        http.request_algo_order_status_report.assert_awaited()
+    finally:
+        engine.dispose()

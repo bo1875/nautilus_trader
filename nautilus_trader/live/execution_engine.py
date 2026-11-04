@@ -145,6 +145,8 @@ class LiveExecutionEngine(ExecutionEngine):
         # Reconciliation
         self._recon_check_retries: Counter[ClientOrderId] = Counter()
         self._ts_last_query: dict[ClientOrderId, int] = {}
+        # Receipt fences exist only while absence queries are outstanding.
+        self._pending_absence_queries: dict[ClientOrderId, set[object]] = {}
         self._order_local_activity_ns: dict[ClientOrderId, int] = {}
         self._position_local_activity_ns: dict[InstrumentId, int] = {}
         self._position_recon_retries: Counter[InstrumentId] = Counter()
@@ -1422,6 +1424,8 @@ class LiveExecutionEngine(ExecutionEngine):
                 return False
 
             phase = "query"
+            query_token = object()
+            self._pending_absence_queries.setdefault(order.client_order_id, set()).add(query_token)
             try:
                 query_ts = self._clock.timestamp_ns()
                 command = GenerateOrderStatusReport(
@@ -1436,8 +1440,15 @@ class LiveExecutionEngine(ExecutionEngine):
                 last_event = order.last_event
                 local_activity = self._order_local_activity_ns.get(order.client_order_id)
                 report = await client.generate_order_status_report(command)
+                observed_during_query = query_token not in self._pending_absence_queries.get(
+                    order.client_order_id,
+                    (),
+                )
+                if report is not None:
+                    self._record_order_report_receipt(report)
                 if (
-                    order.last_event is not last_event
+                    observed_during_query
+                    or order.last_event is not last_event
                     or self._order_local_activity_ns.get(order.client_order_id) != local_activity
                 ):
                     self._log.debug(
@@ -1458,6 +1469,12 @@ class LiveExecutionEngine(ExecutionEngine):
                     f"phase={phase}, error={type(e).__name__}",
                 )
                 return False
+            finally:
+                pending = self._pending_absence_queries.get(order.client_order_id)
+                if pending is not None:
+                    pending.discard(query_token)
+                    if not pending:
+                        self._pending_absence_queries.pop(order.client_order_id, None)
 
         return True
 
@@ -1557,20 +1574,29 @@ class LiveExecutionEngine(ExecutionEngine):
 
         clients = self._clients.values()
 
-        tasks = [
-            c.generate_order_status_reports(
-                GenerateOrderStatusReports(
-                    instrument_id=None,
-                    start=order_status_start,
-                    end=None,
-                    open_only=self.open_check_open_only,
-                    command_id=UUID4(),
-                    ts_init=self._clock.timestamp_ns(),
-                    log_receipt_level=LogLevel.DEBUG,
-                ),
-            )
-            for c in clients
-        ]
+        async def query(client: ExecutionClient) -> list[OrderStatusReport]:
+            try:
+                reports = await client.generate_order_status_reports(
+                    GenerateOrderStatusReports(
+                        instrument_id=None,
+                        start=order_status_start,
+                        end=None,
+                        open_only=self.open_check_open_only,
+                        command_id=UUID4(),
+                        ts_init=self._clock.timestamp_ns(),
+                        log_receipt_level=LogLevel.DEBUG,
+                    ),
+                )
+            except IncompleteOrderStatusReports as e:
+                for report in e.reports:
+                    self._record_order_report_receipt(report)
+                raise
+            # Do not wait for other clients before acknowledging positive receipt.
+            for report in reports:
+                self._record_order_report_receipt(report)
+            return reports
+
+        tasks = [query(client) for client in clients]
 
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
@@ -1607,6 +1633,10 @@ class LiveExecutionEngine(ExecutionEngine):
         all_order_reports: list[OrderStatusReport],
         open_order_ids: set[ClientOrderId],
     ) -> None:
+        # Record the whole collection before any application can abort the pass.
+        for report in all_order_reports:
+            self._record_order_report_receipt(report)
+
         ts_now = self._clock.timestamp_ns()
 
         for report in all_order_reports:
@@ -1848,6 +1878,9 @@ class LiveExecutionEngine(ExecutionEngine):
         Reconcile a single execution report received at runtime, routing to appropriate
         reconciliation method based on report type.
         """
+        if isinstance(report, (OrderStatusReport, FillReport)):
+            self._record_order_report_receipt(report)
+
         self._log.debug(f"<--[RPT] {report}")
         self.report_count += 1
 
@@ -1888,6 +1921,13 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         mass_status: ExecutionMassStatus,
     ) -> bool:
+        # Receipt is evidence even if preprocessing or an earlier row fails.
+        for report in mass_status.order_reports.values():
+            self._record_order_report_receipt(report)
+        for fills in mass_status.fill_reports.values():
+            for fill in fills:
+                self._record_order_report_receipt(fill)
+
         self._log.debug(f"<--[RPT] {mass_status}")
         self.report_count += 1
 
@@ -3631,6 +3671,26 @@ class LiveExecutionEngine(ExecutionEngine):
             self._order_local_activity_ns.pop(order.client_order_id, None)
             self._inferred_fill_ts.pop(order.client_order_id, None)
             self._fill_application_audit.pop(order.client_order_id, None)
+
+    def _record_order_report_receipt(self, report: OrderStatusReport | FillReport) -> None:
+        if not self._pending_absence_queries:
+            return
+
+        for client_order_id in (
+            report.client_order_id,
+            self._cache.client_order_id(report.venue_order_id),
+        ):
+            if client_order_id not in self._pending_absence_queries:
+                continue
+            order = self._cache.order(client_order_id)
+            if (
+                order is not None
+                and order.instrument_id == report.instrument_id
+                and (order.account_id is None or order.account_id == report.account_id)
+            ):
+                # Invalidate every older query for this order, including concurrent queries.
+                # New queries receive new tokens; no observation history is retained.
+                self._pending_absence_queries.pop(client_order_id, None)
 
     def _record_local_activity(self, event: OrderEvent | None) -> None:
         if event is None:

@@ -510,7 +510,8 @@ class OKXExecutionClient(LiveExecutionClient):
         if incomplete is not None:
             raise incomplete
 
-        if reports and canonical_requested_id is not None:
+        # Regular-order coverage does not include untriggered algo orders.
+        if canonical_requested_id is not None:
             return await self._resolve_algo_fallback(
                 canonical_requested_id,
                 command,

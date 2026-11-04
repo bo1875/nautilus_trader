@@ -32,6 +32,7 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import QueryOrder
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
 from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
@@ -41,6 +42,7 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import Venue
@@ -3416,3 +3418,382 @@ async def test_inflight_threshold_requires_current_absence(
     }.get(outcome, OrderStatus.SUBMITTED)
     assert order.status == expected_status
     assert order.filled_qty == Quantity.from_int(50 if outcome == "new_fill" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("entrypoint", ["single", "bulk", "mass", "targeted"])
+@pytest.mark.parametrize("application", ["noop", "error"])
+@pytest.mark.parametrize("identity", ["client", "venue"])
+async def test_positive_report_receipt_invalidates_pending_absence(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    caller,
+    entrypoint,
+    application,
+    identity,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    if caller == "periodic":
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    else:
+        cache.add_venue_order_id(order.client_order_id, VenueOrderId("1"))
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def old_negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    def apply(report, trades):
+        if application == "error":
+            raise TypeError("Synthetic local application failure")
+        return True
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", old_negative)
+    monkeypatch.setattr(engine, "_reconcile_order_report", apply)
+    pending = asyncio.create_task(
+        engine._check_orders_consistency()
+        if caller == "periodic"
+        else engine._check_inflight_orders(),
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    report = OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id if identity == "client" else None,
+        venue_order_id=VenueOrderId("1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.CANCELED if application == "error" else OrderStatus.ACCEPTED,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        report_id=UUID4(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+    try:
+        if entrypoint == "targeted":
+
+            async def targeted(command):
+                return report
+
+            monkeypatch.setattr(exec_client, "generate_order_status_report", targeted)
+            engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+            await engine._check_orders_consistency()
+        elif entrypoint == "bulk":
+
+            async def bulk(command):
+                return [report]
+
+            monkeypatch.setattr(exec_client, "generate_order_status_reports", bulk)
+            await engine._check_orders_consistency()
+        else:
+            context = (
+                pytest.raises(TypeError) if application == "error" else contextlib.nullcontext()
+            )
+            with context:
+                if entrypoint == "single":
+                    engine.reconcile_execution_report(report)
+                else:
+                    mass = ExecutionMassStatus(
+                        client_id=exec_client.id,
+                        account_id=account_id,
+                        venue=SIM,
+                        report_id=UUID4(),
+                        ts_init=0,
+                    )
+                    mass.add_order_reports([report])
+                    engine.reconcile_execution_mass_status(mass)
+        assert order.events == before
+    finally:
+        release.set()
+        await pending
+    assert order.events == before
+    assert not order.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", [False, True])
+async def test_bulk_receipt_fences_absence_before_other_client_finishes(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    incomplete,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    entered, release, slow_entered, slow_release = (asyncio.Event() for _ in range(4))
+
+    async def old_negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", old_negative)
+    pending = asyncio.create_task(engine._check_orders_consistency())
+    await asyncio.wait_for(entered.wait(), 1)
+    report = _absence_test_report(order, account_id)
+
+    async def positive(command):
+        if incomplete:
+            raise IncompleteOrderStatusReports([report])
+        return [report]
+
+    async def slow(command):
+        slow_entered.set()
+        await slow_release.wait()
+        return []
+
+    other_client = MockLiveExecutionClient(
+        loop=asyncio.get_running_loop(),
+        client_id=ClientId("OTHER"),
+        venue=Venue("OTHER"),
+        account_type=AccountType.CASH,
+        base_currency=USD,
+        instrument_provider=InstrumentProvider(),
+        msgbus=engine._msgbus,
+        cache=cache,
+        clock=engine._clock,
+    )
+    engine.register_client(other_client)
+    monkeypatch.setattr(exec_client, "generate_order_status_reports", positive)
+    monkeypatch.setattr(other_client, "generate_order_status_reports", slow)
+    collection = asyncio.create_task(engine._check_orders_consistency())
+    try:
+        await asyncio.wait_for(slow_entered.wait(), 1)
+        release.set()
+        await pending
+        assert order.events == before
+    finally:
+        release.set()
+        slow_release.set()
+        await pending
+        await collection
+
+
+def _absence_test_report(order, account_id):
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        report_id=UUID4(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_receipt_invalidates_all_older_queries_but_not_a_new_query(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    before = list(order.events)
+    entered = [asyncio.Event() for _ in range(3)]
+    release = [asyncio.Event() for _ in range(3)]
+    calls = 0
+
+    async def negative(command):
+        nonlocal calls
+        index = calls
+        calls += 1
+        entered[index].set()
+        await release[index].wait()
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    tasks = []
+    try:
+        for index in range(3):
+            if index == 2:
+                assert engine.reconcile_execution_report(_absence_test_report(order, account_id))
+            engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+            tasks.append(asyncio.create_task(engine._check_orders_consistency()))
+            await asyncio.wait_for(entered[index].wait(), 1)
+        release[0].set()
+        release[1].set()
+        await asyncio.gather(*tasks[:2])
+        assert order.events == before
+        release[2].set()
+        await tasks[2]
+        assert order.status == OrderStatus.REJECTED
+        assert not engine._pending_absence_queries
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("different", ["order", "account", "instrument", "no_report"])
+async def test_unrelated_receipt_does_not_invalidate_qualified_absence(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    different,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    report = _absence_test_report(order, account_id)
+    if different == "order":
+        report.client_order_id = ClientOrderId("OTHER")
+        report.venue_order_id = VenueOrderId("OTHER")
+    elif different == "account":
+        report.account_id = AccountId("OTHER-001")
+    elif different == "instrument":
+        report.instrument_id = GBPUSD_SIM.id
+    monkeypatch.setattr(engine, "_reconcile_order_report", lambda report, trades: True)
+
+    async def negative(command):
+        if different != "no_report":
+            engine.reconcile_execution_report(report)
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    await engine._check_orders_consistency()
+    assert order.status == OrderStatus.REJECTED
+    assert not engine._pending_absence_queries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["bulk", "mass"])
+async def test_all_collection_receipts_are_fenced_before_first_application_failure(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    entrypoint,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    before = list(order.events)
+    target = _absence_test_report(order, account_id)
+    first = _absence_test_report(order, account_id)
+    first.client_order_id = ClientOrderId("OTHER")
+    first.venue_order_id = VenueOrderId("OTHER")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    def fail(report, trades):
+        assert report.client_order_id == first.client_order_id
+        raise TypeError("Synthetic first-row failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    monkeypatch.setattr(engine, "_reconcile_order_report", fail)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    pending = asyncio.create_task(engine._check_orders_consistency())
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        if entrypoint == "bulk":
+
+            async def bulk(command):
+                return [first, target]
+
+            monkeypatch.setattr(exec_client, "generate_order_status_reports", bulk)
+            await engine._check_orders_consistency()
+        else:
+            mass = ExecutionMassStatus(
+                client_id=exec_client.id,
+                account_id=account_id,
+                venue=SIM,
+                report_id=UUID4(),
+                ts_init=0,
+            )
+            mass.add_order_reports([first, target])
+            with pytest.raises(TypeError):
+                engine.reconcile_execution_mass_status(mass)
+    finally:
+        release.set()
+        await pending
+    assert order.events == before
+
+
+def _open_absence_test_order(cache, client, account_id):
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    return order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_absence_receipt_fence_is_released_after_failed_query(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    cancel,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+
+    async def failed(command):
+        if cancel:
+            raise asyncio.CancelledError
+        raise TimeoutError("Synthetic read failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", failed)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    context = pytest.raises(asyncio.CancelledError) if cancel else contextlib.nullcontext()
+    with context:
+        await engine._check_orders_consistency()
+    assert order.status == OrderStatus.ACCEPTED
+    assert not engine._pending_absence_queries
+
+    async def negative(command):
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    await engine._check_orders_consistency()
+    assert order.status == OrderStatus.REJECTED
+    assert not engine._pending_absence_queries
