@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -2019,3 +2020,125 @@ async def test_reconnect_failed_connect_keeps_admission_closed(
     await asyncio.sleep(0)
     recover.assert_not_awaited()
     assert client._ws_recovery_required
+
+
+def _track_delayed_collection(client, release_read, canceled, collected, suppress_cancellation):
+    collect = client.generate_mass_status
+
+    async def tracked_collection():
+        lifecycle = client._ws_recovery_lifecycle
+        try:
+            report = await collect()
+        except asyncio.CancelledError:
+            canceled.set()
+            if not suppress_cancellation:
+                raise
+            while not release_read.is_set():
+                with suppress(asyncio.CancelledError):
+                    await release_read.wait()
+            report = await collect()
+        collected.append((lifecycle, report))
+        return report
+
+    return tracked_collection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_failure", ["error", "cancel"])
+@pytest.mark.parametrize(
+    "retire",
+    ["before_retry", "after_retry", "cancel_suppressed", "disconnect_retry", "no_new_reconnect"],
+)
+async def test_reconnect_retry_after_failed_startup_has_one_current_recovery(
+    exec_client_builder,
+    monkeypatch,
+    startup_failure,
+    retire,
+):
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    monkeypatch.setattr(client, "_await_account_registered", AsyncMock())
+    monkeypatch.setattr(nautilus_pyo3, "OKXWebSocketReconnect", SimpleNamespace)
+    startup = asyncio.Event()
+    fail_startup = asyncio.Event()
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    canceled = asyncio.Event()
+    reads = []
+    collected = []
+    reports = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", reports.append)
+
+    async def wait_for_business(**kwargs):
+        startup.set()
+        await fail_startup.wait()
+        raise RuntimeError("synthetic business startup failure")
+
+    async def orders(command):
+        reads.append(client._ws_recovery_lifecycle)
+        if len(reads) == 1:
+            read_started.set()
+            await release_read.wait()
+        return []
+
+    tracked_collection = _track_delayed_collection(
+        client,
+        release_read,
+        canceled,
+        collected,
+        suppress_cancellation=retire in ("cancel_suppressed", "disconnect_retry"),
+    )
+
+    business_ws.wait_until_active.side_effect = wait_for_business
+    monkeypatch.setattr(client, "generate_mass_status", tracked_collection)
+    monkeypatch.setattr(client, "generate_order_status_reports", orders)
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client.connect()
+    await asyncio.wait_for(startup.wait(), 2)
+    old_callback = private_ws.connect.call_args.kwargs["callback"]
+    old_callback(event)
+    await asyncio.wait_for(read_started.wait(), 2)
+    old_task = client._ws_recovery_task
+    old_lifecycle = client._ws_recovery_lifecycle
+    if startup_failure == "cancel":
+        next(t for t in client._tasks if t.get_name() == "_connect" and not t.done()).cancel()
+    else:
+        fail_startup.set()
+    await eventually(lambda: client._ws_recovery_lifecycle is None)
+    assert not client.is_connected
+    if retire == "before_retry":
+        release_read.set()
+        await old_task
+    business_ws.wait_until_active.side_effect = None
+    await _connect_recovery_client(client, monkeypatch)
+    current_lifecycle = client._ws_recovery_lifecycle
+    current_callback = private_ws.connect.call_args.kwargs["callback"]
+    if retire != "no_new_reconnect":
+        current_callback(event)
+    if retire == "cancel_suppressed":
+        old_task.cancel()
+        await asyncio.wait_for(canceled.wait(), 2)
+    if retire == "disconnect_retry":
+        client.disconnect()
+        await asyncio.wait_for(canceled.wait(), 2)
+    release_read.set()
+    await eventually(lambda: client._ws_recovery_task.done())
+    if retire == "no_new_reconnect":
+        assert not reports
+        assert client._ws_recovery_required
+        current_callback(event)
+        await client._ws_recovery_task
+    try:
+        assert all(report is not None for _, report in collected)
+        old_reports = [report for owner, report in collected if owner is old_lifecycle]
+        current_reports = [report for owner, report in collected if owner is current_lifecycle]
+        assert len(old_reports) == 1
+        assert all(report not in reports for report in old_reports)
+        assert len(current_reports) == int(retire != "disconnect_retry")
+        assert reports == current_reports
+        assert client._ws_recovery_required == (retire == "disconnect_retry")
+    finally:
+        client.disconnect()
+        await eventually(lambda: not client.is_connected)

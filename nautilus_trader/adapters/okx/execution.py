@@ -196,6 +196,7 @@ class OKXExecutionClient(LiveExecutionClient):
         self._ws_recovery_task: asyncio.Task | None = None
         self._ws_recovery_required = False
         self._ws_recovery_lifecycle: object | None = None
+        self._ws_recovery_requested_lifecycle: object | None = None
 
         self._ws_business_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=nautilus_pyo3.get_okx_ws_url_business(config.is_demo),
@@ -367,6 +368,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
     def _close_ws_recovery(self) -> None:
         self._ws_recovery_lifecycle = None
+        self._ws_recovery_requested_lifecycle = None
         if self._ws_recovery_task is not None and not self._ws_recovery_task.done():
             self._ws_recovery_required = True
 
@@ -1860,6 +1862,7 @@ class OKXExecutionClient(LiveExecutionClient):
         lifecycle = self._ws_recovery_lifecycle
         if lifecycle is None:
             return
+        self._ws_recovery_requested_lifecycle = lifecycle
         if not getattr(self, "_mass_status_reports_complete", False):
             self._log.warning(
                 "Reconnect recovery requires a strict mass-report collector or recovery hook override",
@@ -1869,30 +1872,47 @@ class OKXExecutionClient(LiveExecutionClient):
             self._ws_recovery_task = self.create_task(self._recover_after_ws_reconnect(lifecycle))
 
     async def _recover_after_ws_reconnect(self, lifecycle: object) -> None:
-        # Coalesce bursts without dropping a reconnect arriving during a read.
-        while self._ws_recovery_lifecycle is lifecycle and self._ws_recovery_required:
-            self._ws_recovery_required = False
-            try:
-                report = await self.generate_mass_status()
-                if self._ws_recovery_lifecycle is not lifecycle:
+        try:
+            # Coalesce bursts without dropping a reconnect arriving during a read.
+            while self._ws_recovery_lifecycle is lifecycle and self._ws_recovery_required:
+                self._ws_recovery_required = False
+                try:
+                    report = await self.generate_mass_status()
+                    if self._ws_recovery_lifecycle is not lifecycle:
+                        return
+                    if report is None:
+                        self._ws_recovery_required = True
+                        self._log.warning(
+                            "Reconnect readback incomplete; recovery remains required"
+                        )
+                        return
+                    self._msgbus.send(
+                        endpoint="ExecEngine.reconcile_execution_mass_status",
+                        msg=report,
+                    )
+                except asyncio.CancelledError:
+                    if self._ws_recovery_lifecycle is lifecycle:
+                        self._ws_recovery_required = True
+                    raise
+                except Exception as exc:
+                    if self._ws_recovery_lifecycle is lifecycle:
+                        self._ws_recovery_required = True
+                    self._log.exception("Reconnect readback failed; recovery remains required", exc)
                     return
-                if report is None:
-                    self._ws_recovery_required = True
-                    self._log.warning("Reconnect readback incomplete; recovery remains required")
-                    return
-                self._msgbus.send(
-                    endpoint="ExecEngine.reconcile_execution_mass_status",
-                    msg=report,
-                )
-            except asyncio.CancelledError:
-                if self._ws_recovery_lifecycle is lifecycle:
-                    self._ws_recovery_required = True
-                raise
-            except Exception as exc:
-                if self._ws_recovery_lifecycle is lifecycle:
-                    self._ws_recovery_required = True
-                self._log.exception("Reconnect readback failed; recovery remains required", exc)
-                return
+        finally:
+            current = self._ws_recovery_lifecycle
+            if (
+                current is not None
+                and current is not lifecycle
+                and self._ws_recovery_requested_lifecycle is current
+                and self._ws_recovery_required
+                and self._ws_recovery_task is asyncio.current_task()
+                and getattr(self, "_mass_status_reports_complete", False)
+            ):
+                # A failed startup can leave this read owning the slot across a
+                # retry. Hand off only after it retires, and only for a reconnect
+                # in the current lifecycle. No stale report or read is reused.
+                self._ws_recovery_task = self.create_task(self._recover_after_ws_reconnect(current))
 
     def _handle_instrument_update(self, pyo3_instrument: OkxInstrument) -> None:
         self._http_client.cache_instrument(pyo3_instrument)  # type: ignore [arg-type]
