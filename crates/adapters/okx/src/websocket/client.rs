@@ -606,7 +606,7 @@ impl OKXWebSocketClient {
                 // Main message loop with explicit reconnection handling
                 loop {
                     match handler.next().await {
-                        Some(NautilusWsMessage::Reconnected) => {
+                        Some(NautilusWsMessage::Reconnected(event)) => {
                             if signal.load(Ordering::Acquire) {
                                 continue;
                             }
@@ -672,9 +672,10 @@ impl OKXWebSocketClient {
                                 resubscribe_all();
                             }
 
-                            // TODO: Implement proper Reconnected event forwarding to consumers.
-                            // Currently intercepted for internal housekeeping only. Will add new
-                            // message type from WebSocketClient to notify consumers of reconnections.
+                            if handler.send(NautilusWsMessage::Reconnected(event)).is_err() {
+                                log::error!("Reconnect recovery consumer dropped");
+                                break;
+                            }
                         }
                         Some(NautilusWsMessage::Authenticated) => {
                             if has_reconnected {

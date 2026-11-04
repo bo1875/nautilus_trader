@@ -1076,6 +1076,17 @@ async fn test_true_auto_reconnect_with_verification() {
         .expect("second message timeout")
         .expect("stream closed after reconnect");
 
+    let NautilusWsMessage::Reconnected(event) = second else {
+        panic!("Expected reconnect recovery notification");
+    };
+    assert_eq!(event.pending_count, 0);
+    assert_eq!(event.omitted_count, 0);
+    assert_eq!(event.connection_generation, 1);
+    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("resubscription message timeout")
+        .expect("stream closed");
+
     match second {
         NautilusWsMessage::Data(payload) => {
             assert!(!payload.is_empty());
