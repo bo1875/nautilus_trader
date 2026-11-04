@@ -323,7 +323,7 @@ impl OKXWebSocketClient {
                             forward_reconnect(&call_soon, &callback, msg);
                         }
                         NautilusWsMessage::RequestObservation(msg) => {
-                            call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
+                            forward_request_observation(&call_soon, &callback, msg);
                         }
                         NautilusWsMessage::Authenticated => {} // Nothing to handle
                         NautilusWsMessage::Error(msg) => {
@@ -1258,9 +1258,17 @@ fn forward_reconnect(
     call_python_with_data(call_soon, callback, |py| event.into_py_any(py));
 }
 
+fn forward_request_observation(
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+    observation: crate::websocket::messages::OKXRequestObservation,
+) {
+    call_python_with_data(call_soon, callback, |py| observation.into_py_any(py));
+}
+
 #[cfg(test)]
 mod reconnect_tests {
-    use super::forward_reconnect;
+    use super::{forward_reconnect, forward_request_observation};
     use crate::websocket::messages::{OKXRequestObservation, OKXWebSocketReconnect};
     use pyo3::{prelude::*, types::PyDict};
     use std::ffi::CString;
@@ -1316,6 +1324,54 @@ call_soon = loop.call_soon_threadsafe
             py.run(&setup, Some(&globals), None).unwrap();
             let call_soon = globals.get_item("call_soon").unwrap().unwrap().unbind();
             let callback = globals.get_item("callback").unwrap().unwrap().unbind();
+            py.run(&CString::new("observations = []; client._handle_ws_request_observation = observations.append").unwrap(), Some(&globals), None).unwrap();
+            let observation: OKXRequestObservation = serde_json::from_value(serde_json::json!({
+                "schema_version":2, "connection_id":"synthetic-connection", "connection_generation":1,
+                "request_id":"", "operation":"orders", "client_order_id":"TEST-ORDER",
+                "venue_order_id":"12345", "instrument_id":"BTC-USDT-SWAP", "requested_price":null,
+                "requested_size":null, "ts_handler_ns":0, "ts_send_completed_ns":null,
+                "ts_observed_ns":2000, "outcome":"updated_forwarded", "response_code":null,
+                "event_id":"00000000-0000-4000-8000-000000000001", "ts_received_ns":1000,
+                "ts_venue_ns":500, "observed_price":"100", "observed_size":"2"
+            })).unwrap();
+            let mut legacy = serde_json::to_value(&observation).unwrap();
+            legacy["schema_version"] = 1.into();
+            for key in [
+                "event_id",
+                "ts_received_ns",
+                "ts_venue_ns",
+                "observed_price",
+                "observed_size",
+            ] {
+                legacy.as_object_mut().unwrap().remove(key);
+            }
+            let legacy: OKXRequestObservation = serde_json::from_value(legacy).unwrap();
+            assert!(legacy.event_id.is_none());
+            assert!(legacy.ts_received_ns.is_none());
+            forward_request_observation(&call_soon, &callback, observation);
+            py.run(
+                &CString::new(
+                    r#"
+loop.run_until_complete(asyncio.sleep(0))
+assert len(observations) == 1
+item = observations[0]
+assert item.event_id == "00000000-0000-4000-8000-000000000001"
+assert item.ts_received_ns == 1000 and item.ts_venue_ns == 500
+assert item.ts_handler_ns == 0 and item.request_id == ""
+assert item.observed_price == "100" and item.observed_size == "2"
+try:
+    item.outcome = "applied"
+except AttributeError:
+    pass
+else:
+    raise AssertionError("observation must be immutable")
+"#,
+                )
+                .unwrap(),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
             for generation in 1..=2 {
                 forward_reconnect(
                     &call_soon,

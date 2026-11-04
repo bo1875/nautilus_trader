@@ -661,3 +661,50 @@ node.build()
 For additional features or to contribute to the OKX adapter, please see our
 [contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
 :::
+
+### Confirmed order terms and diagnostics
+
+Orders-channel observations seed confirmed price and quantity even when a
+placement response already emitted acceptance. A successful amend response still
+only retires transport correlation; it does not confirm terms. ACCEPTED status
+reports reconcile changed terms without generating another acceptance for an
+open or pending order. Unchanged or older reports leave pending operations alone.
+Terminal orders cannot reopen, and an update cannot reduce quantity below fills.
+Periodic reconciliation remains necessary for missing messages and recovery.
+
+`OKXRequestObservation` retains schema 1 request fields and adds optional
+`event_id`, `ts_received_ns`, `ts_venue_ns`, `observed_price`, and `observed_size`
+getters. Schema 2 orders observations pass through the same
+`_handle_ws_request_observation` hook. They describe decoded receipt before
+filtering and the forward/drop decision. An emitted lifecycle event carries its
+actual UUID; reports and dropped observations have no event UUID. An empty
+request ID and zero handler timestamp mean unknown, never a duration anchor.
+An orders push does not identify the operation which caused it. Matching terms
+or order IDs alone must not be interpreted as an operation acknowledgement.
+
+Local timestamps are UNIX nanoseconds. Receipt is the handler's decoded-frame
+boundary, not socket arrival; handler registration is not caller intent, and
+send completion is a local transport return. Venue time is a separate clock.
+Diagnostic callbacks can arrive on a different scheduling path from lifecycle
+events; UUID correlation does not imply callback order.
+
+The live execution engine publishes immutable `OrderApplyObservation` tuples on
+`execution.order_apply_observation`: `event_id`, `client_order_id`,
+`ts_observed_ns`, `outcome`, and `observations_dropped`. `applied` means that the
+native cache accepted that event UUID, not durable persistence or settlement.
+Other outcomes are `not_applied`, `error`, `stale`, `terminal`, `below_filled`, and
+`duplicate`. Subscribers must enqueue without blocking. Subscriber errors do
+not change lifecycle processing. No correlation history is retained.
+
+Transport diagnostics share the existing 4,096-attempt budget per connection
+generation; reconnect detail remains capped at 128. Engine apply diagnostics
+have a separate 4,096-attempt budget per engine lifetime. After saturation the
+engine retains `_apply_observations_dropped` for inspection and warns once;
+there are no later payloads promising a final loss count. These counts describe
+refused/failed diagnostic attempts, not lost acknowledgements. Existing queues
+remain unbounded; neither budget bounds process memory or certifies coverage.
+
+These changes build on the request/reconnect contract in PR #3. Automatic native
+reconnect readback additionally requires the strict all-reader completeness
+contract in PR #4. Neither diagnostics nor source availability qualifies a
+packaged deployment or replaces an integration's recovery owner.

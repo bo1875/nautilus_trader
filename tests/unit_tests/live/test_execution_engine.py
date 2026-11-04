@@ -1455,3 +1455,209 @@ class TestLiveExecutionEngine:
         assert order.overfill_qty == Quantity.from_str("37.5")
         assert order.leaves_qty == Quantity.from_str("0.0")
         assert order.status == OrderStatus.FILLED
+
+    @pytest.mark.parametrize("pending", [False, True])
+    def test_accepted_report_updates_confirmed_terms(self, pending):
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+        if pending:
+            order.apply(TestEventStubs.order_pending_update(order))
+        self.cache.update_order(order)
+        count = order.event_count
+        report = OrderStatusReport(
+            account_id=order.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.ACCEPTED,
+            quantity=Quantity.from_int(120),
+            filled_qty=Quantity.from_int(0),
+            price=Price.from_str("1.10000"),
+            report_id=UUID4(),
+            ts_accepted=1,
+            ts_last=self.clock.timestamp_ns(),
+            ts_init=0,
+        )
+        assert self.exec_engine.reconcile_execution_report(report)
+        assert order.quantity == report.quantity
+        assert order.price == report.price
+        assert order.status == OrderStatus.ACCEPTED
+        assert order.event_count == count + 1
+        assert self.exec_engine.reconcile_execution_report(report)
+        assert order.event_count == count + 1
+        # Older and unchanged readback cannot resolve a newer pending operation.
+        order.apply(TestEventStubs.order_pending_update(order))
+        count = order.event_count
+        assert self.exec_engine.reconcile_execution_report(report)
+        report.quantity = Quantity.from_int(90)
+        report.ts_last -= 1
+        assert self.exec_engine.reconcile_execution_report(report)
+        assert order.event_count == count
+        assert order.status == OrderStatus.PENDING_UPDATE
+        assert order.quantity == Quantity.from_int(120)
+
+    def test_confirmed_terms_preserve_fills_terminal_and_apply_observations(self):
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDUSD_SIM,
+            trade_id=TradeId("FILL-TERMS"),
+            last_qty=Quantity.from_int(40),
+        )
+        self.exec_engine._handle_event_with_tracking(fill)
+        observations = []
+        self.msgbus.subscribe("execution.order_apply_observation", observations.append)
+        report = OrderStatusReport(
+            account_id=order.account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.ACCEPTED,
+            quantity=Quantity.from_int(30),
+            filled_qty=Quantity.from_int(40),
+            price=Price.from_str("1.10000"),
+            report_id=UUID4(),
+            ts_accepted=1,
+            ts_last=self.clock.timestamp_ns(),
+            ts_init=0,
+        )
+        assert not self.exec_engine.reconcile_execution_report(report)
+        assert order.quantity == Quantity.from_int(100)
+        report.quantity = Quantity.from_int(120)
+        assert self.exec_engine.reconcile_execution_report(report)
+        assert order.filled_qty == Quantity.from_int(40)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+        updated = order.last_event
+        assert observations[-1].event_id == str(updated.id)
+        assert observations[-1].outcome == "applied"
+        assert observations[-1].ts_observed_ns >= updated.ts_init
+        self.exec_engine._handle_event_with_tracking(updated)
+        assert observations[-1].outcome == "duplicate"
+        count = order.event_count
+        self.exec_engine._handle_event_with_tracking(fill)
+        assert order.event_count == count
+        assert order.filled_qty == Quantity.from_int(40)
+        order.apply(TestEventStubs.order_canceled(order))
+        self.cache.update_order(order)
+        count = order.event_count
+        report.quantity = Quantity.from_int(150)
+        report.ts_last += 1
+        assert self.exec_engine.reconcile_execution_report(report)
+        self.exec_engine._handle_event_with_tracking(updated)
+        assert observations[-1].outcome == "terminal"
+        assert order.event_count == count
+        assert order.status == OrderStatus.CANCELED
+
+    def test_apply_diagnostics_failure_and_saturation_do_not_affect_terms(self):
+        def fail(_):
+            raise RuntimeError("synthetic diagnostic failure")
+
+        self.msgbus.subscribe("execution.order_apply_observation", fail)
+        self.test_accepted_report_updates_confirmed_terms(False)
+        assert self.exec_engine._apply_observations_dropped == 1
+        self.exec_engine._apply_observations_emitted = 4096
+        self.test_accepted_report_updates_confirmed_terms(False)
+        assert self.exec_engine._apply_observations_dropped == 2
+
+    @pytest.mark.asyncio
+    async def test_queued_term_updates_keep_cancel_pending_and_reject_stale_or_small(self):
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                instrument=AUDUSD_SIM,
+                last_qty=Quantity.from_int(40),
+            )
+        )
+        order.apply(TestEventStubs.order_pending_cancel(order))
+        self.cache.update_order(order)
+        observations = []
+        self.msgbus.subscribe("execution.order_apply_observation", observations.append)
+        updated = TestEventStubs.order_updated(order, quantity=Quantity.from_int(120), ts_event=100)
+        self.exec_engine.process(updated)
+        assert not observations  # Enqueue is not application.
+        await eventually(lambda: len(observations) == 1)
+        assert order.quantity == Quantity.from_int(120)
+        assert order.status == OrderStatus.PENDING_CANCEL
+        assert observations[-1].outcome == "applied"
+        assert observations[-1].event_id == str(updated.id)
+        self.exec_engine.process(
+            TestEventStubs.order_updated(
+                order,
+                quantity=Quantity.from_int(110),
+                ts_event=99,
+            )
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_updated(
+                order,
+                quantity=Quantity.from_int(30),
+                price=Price.from_str("1.10000"),
+                ts_event=101,
+            )
+        )
+        await eventually(lambda: len(observations) == 3)
+        assert [item.outcome for item in observations] == ["applied", "stale", "below_filled"]
+        assert order.quantity == Quantity.from_int(120)
+        assert order.filled_qty == Quantity.from_int(40)
+        assert order.status == OrderStatus.PENDING_CANCEL
+
+    @pytest.mark.asyncio
+    async def test_queued_amended_terms_precede_large_fill_and_duplicate_fill_is_ignored(self):
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+        order.apply(TestEventStubs.order_pending_update(order))
+        self.cache.update_order(order)
+        updated = TestEventStubs.order_updated(order, quantity=Quantity.from_int(150), ts_event=100)
+        fill = TestEventStubs.order_filled(
+            order,
+            instrument=AUDUSD_SIM,
+            last_qty=Quantity.from_int(120),
+            trade_id=TradeId("AMENDED-FILL"),
+        )
+        self.exec_engine.process(updated)
+        self.exec_engine.process(fill)
+        await eventually(lambda: order.filled_qty == Quantity.from_int(120))
+        assert order.quantity == Quantity.from_int(150)
+        assert order.status == OrderStatus.PARTIALLY_FILLED
+        count = order.event_count
+        self.exec_engine.process(fill)
+        await eventually(lambda: self.exec_engine.event_count >= 3)
+        assert order.event_count == count
+        assert order.filled_qty == Quantity.from_int(120)

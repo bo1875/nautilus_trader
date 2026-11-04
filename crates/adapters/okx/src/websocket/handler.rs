@@ -845,6 +845,36 @@ impl OKXWsFeedHandler {
             ts_observed_ns: now,
             outcome: "handler_received".into(),
             response_code: None,
+            event_id: None,
+            ts_received_ns: None,
+            ts_venue_ns: None,
+            observed_price: None,
+            observed_size: None,
+        }
+    }
+
+    fn receive_observation(&self, operation: &str, ts_init: UnixNanos) -> OKXRequestObservation {
+        OKXRequestObservation {
+            schema_version: 2,
+            connection_id: self.connection_id.clone(),
+            connection_generation: self.connection_generation,
+            request_id: String::new(),
+            operation: operation.into(),
+            client_order_id: String::new(),
+            venue_order_id: None,
+            instrument_id: String::new(),
+            requested_price: None,
+            requested_size: None,
+            ts_handler_ns: 0, // Unknown: no matched operation, never a duration anchor.
+            ts_send_completed_ns: None,
+            ts_observed_ns: ts_init.as_u64(),
+            outcome: "received".into(),
+            response_code: None,
+            event_id: None,
+            ts_received_ns: Some(ts_init.as_u64()),
+            ts_venue_ns: None,
+            observed_price: None,
+            observed_size: None,
         }
     }
 
@@ -1033,6 +1063,52 @@ impl OKXWsFeedHandler {
 
     #[allow(clippy::too_many_lines)]
     fn handle_order_response(
+        &mut self,
+        id: Option<String>,
+        op: OKXWsOperation,
+        code: String,
+        msg: String,
+        data: Vec<Value>,
+        ts_init: UnixNanos,
+    ) -> Option<NautilusWsMessage> {
+        let matched = id
+            .as_deref()
+            .and_then(|id| {
+                self.pending_amend_requests
+                    .get(id)
+                    .or_else(|| self.pending_cancel_requests.get(id))
+            })
+            .filter(|pending| pending.5.operation == op.to_string());
+        let mut observation = matched
+            .map(|pending| pending.5.clone())
+            .unwrap_or_else(|| self.receive_observation(&op.to_string(), ts_init));
+        // The frame request id is observable even when no retained operation matches.
+        observation.request_id = id.clone().unwrap_or_default();
+        observation.ts_received_ns = Some(ts_init.as_u64());
+        observation.ts_observed_ns = ts_init.as_u64();
+        observation.outcome = "response_received".into();
+        observation.response_code = Some(code.clone());
+        let was_matched = matched.is_some();
+        self.emit_request_observation(observation.clone());
+        let result = self.handle_order_response_inner(id.clone(), op, code, msg, data, ts_init);
+        let still_pending = id.as_deref().is_some_and(|id| {
+            self.pending_amend_requests.contains_key(id)
+                || self.pending_cancel_requests.contains_key(id)
+        });
+        if !was_matched || still_pending {
+            observation.outcome = if was_matched {
+                "response_unresolved"
+            } else {
+                "response_unmatched"
+            }
+            .into();
+            observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+            self.emit_request_observation(observation);
+        }
+        result
+    }
+
+    fn handle_order_response_inner(
         &mut self,
         id: Option<String>,
         op: OKXWsOperation,
@@ -1586,6 +1662,9 @@ impl OKXWsFeedHandler {
             Ok(orders) => orders,
             Err(e) => {
                 log::error!("Failed to deserialize orders channel payload: {e}");
+                let mut observation = self.receive_observation("orders", ts_init);
+                observation.outcome = "malformed_orders".into();
+                self.emit_request_observation(observation);
                 return None;
             }
         };
@@ -1598,6 +1677,17 @@ impl OKXWsFeedHandler {
         let mut exec_reports: Vec<ExecutionReport> = Vec::with_capacity(orders.len());
 
         for msg in orders {
+            let mut observation = self.receive_observation("orders", ts_init);
+            observation.client_order_id = msg.cl_ord_id.to_string();
+            observation.venue_order_id = Some(msg.ord_id.to_string());
+            observation.instrument_id = self.instruments_cache.get(&msg.inst_id).map_or_else(
+                || msg.inst_id.to_string(),
+                |instrument| instrument.id().to_string(),
+            );
+            observation.ts_venue_ns = Some(parse_millisecond_timestamp(msg.u_time).as_u64());
+            observation.observed_price = Some(msg.px.clone());
+            observation.observed_size = Some(msg.sz.clone());
+            self.emit_request_observation(observation.clone());
             log::debug!(
                 "Processing order message: inst_id={}, cl_ord_id={}, state={:?}, exec_type={:?}",
                 msg.inst_id,
@@ -1607,6 +1697,8 @@ impl OKXWsFeedHandler {
             );
 
             if self.try_handle_post_only_auto_cancel(&msg, ts_init, &mut exec_reports) {
+                observation.outcome = "post_only_cancel_handled".into();
+                self.emit_request_observation(observation);
                 continue;
             }
 
@@ -1624,6 +1716,8 @@ impl OKXWsFeedHandler {
                     "No instrument found for inst_id: {inst_id}",
                     inst_id = msg.inst_id
                 );
+                observation.outcome = "missing_instrument".into();
+                self.emit_request_observation(observation);
                 continue;
             };
             let price_precision = instrument.price_precision();
@@ -1636,6 +1730,17 @@ impl OKXWsFeedHandler {
             let previous_filled_qty = self.filled_qty_cache.get(&msg.ord_id).copied();
             let previous_state =
                 effective_client_id.and_then(|cid| self.order_state_cache.get(&cid).cloned());
+            // Do not regress confirmed live terms on delayed pushes. Fills still
+            // pass through their existing trade-id/cumulative-quantity safeguards.
+            if msg.state == OKXOrderStatus::Live
+                && previous_state.as_ref().is_some_and(|previous| {
+                    parse_millisecond_timestamp(msg.u_time) <= previous.ts_event
+                })
+            {
+                observation.outcome = "stale_or_duplicate".into();
+                self.emit_request_observation(observation);
+                continue;
+            }
 
             // order_metadata being Some implies effective_client_id is Some
             if let (Some((trader_id, strategy_id, _instrument_id)), Some(canonical_client_id)) =
@@ -1654,6 +1759,109 @@ impl OKXWsFeedHandler {
                     ts_init,
                 ) {
                     Ok(event) => {
+                        if let ParsedOrderEvent::Updated(updated) = &event {
+                            let filled = previous_filled_qty
+                                .unwrap_or_else(|| Quantity::zero(size_precision));
+                            let reported_filled = parse_quantity(
+                                msg.acc_fill_sz.as_deref().unwrap_or("0"),
+                                size_precision,
+                            )
+                            .ok();
+                            if updated.quantity < filled
+                                || reported_filled.is_some_and(|qty| updated.quantity < qty)
+                            {
+                                observation.outcome = "below_filled".into();
+                                self.emit_request_observation(observation);
+                                continue;
+                            }
+                            if previous_state
+                                .as_ref()
+                                .is_some_and(|previous| updated.ts_event <= previous.ts_event)
+                            {
+                                observation.outcome = "stale_or_duplicate".into();
+                                self.emit_request_observation(observation);
+                                continue;
+                            }
+                        }
+                        // A fill push can also carry confirmed amended terms.
+                        // Deliver those first so a fill of the enlarged order is
+                        // not rejected against the old quantity in the engine.
+                        let terms = if matches!(&event, ParsedOrderEvent::Fill(_))
+                            && previous_state.as_ref().is_some_and(|previous| {
+                                parse_millisecond_timestamp(msg.u_time) > previous.ts_event
+                            })
+                            && parse_quantity(&msg.sz, size_precision)
+                                .ok()
+                                .zip(
+                                    parse_quantity(
+                                        msg.acc_fill_sz.as_deref().unwrap_or("0"),
+                                        size_precision,
+                                    )
+                                    .ok(),
+                                )
+                                .is_some_and(|(quantity, filled)| quantity >= filled)
+                        {
+                            let mut terms_msg = msg.clone();
+                            terms_msg.state = OKXOrderStatus::Live;
+                            terms_msg.fill_sz = "0".into();
+                            terms_msg.trade_id.clear();
+                            terms_msg.acc_fill_sz = None;
+                            parse_order_event(
+                                &terms_msg,
+                                canonical_client_id,
+                                self.account_id,
+                                trader_id,
+                                strategy_id,
+                                instrument,
+                                previous_fee,
+                                previous_filled_qty,
+                                previous_state.as_ref(),
+                                ts_init,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        if let Some(ParsedOrderEvent::Updated(updated)) = terms {
+                            let mut terms_observation = observation.clone();
+                            terms_observation.outcome = "updated_forwarded".into();
+                            terms_observation.event_id = Some(updated.event_id.to_string());
+                            terms_observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+                            self.process_parsed_order_event(
+                                ParsedOrderEvent::Updated(updated),
+                                &msg,
+                                price_precision,
+                                size_precision,
+                                canonical_client_id,
+                                &raw_child,
+                                &mut exec_reports,
+                            );
+                            self.emit_request_observation(terms_observation);
+                        }
+                        let (outcome, event_id) = match &event {
+                            ParsedOrderEvent::Accepted(e)
+                                if !self.emitted_accepted.contains(&e.venue_order_id) =>
+                            {
+                                ("accepted_forwarded", Some(e.event_id.to_string()))
+                            }
+                            ParsedOrderEvent::Accepted(_) => ("duplicate_accepted_seeded", None),
+                            ParsedOrderEvent::Updated(e) => {
+                                ("updated_forwarded", Some(e.event_id.to_string()))
+                            }
+                            ParsedOrderEvent::Canceled(e) => {
+                                ("canceled_forwarded", Some(e.event_id.to_string()))
+                            }
+                            ParsedOrderEvent::Expired(e) => {
+                                ("expired_forwarded", Some(e.event_id.to_string()))
+                            }
+                            ParsedOrderEvent::Triggered(e) => {
+                                ("triggered_forwarded", Some(e.event_id.to_string()))
+                            }
+                            ParsedOrderEvent::Fill(_) => ("fill_report_forwarded", None),
+                            ParsedOrderEvent::StatusOnly(_) => ("status_report_forwarded", None),
+                        };
+                        observation.outcome = outcome.into();
+                        observation.event_id = event_id;
                         self.process_parsed_order_event(
                             event,
                             &msg,
@@ -1664,7 +1872,10 @@ impl OKXWsFeedHandler {
                             &mut exec_reports,
                         );
                     }
-                    Err(e) => log::error!("Failed to parse order event: {e}"),
+                    Err(e) => {
+                        observation.outcome = "parse_error".into();
+                        log::error!("Failed to parse order event: {e}");
+                    }
                 }
             } else {
                 // External order or not tracked - use old parse_order_msg for backward compatibility
@@ -1682,10 +1893,16 @@ impl OKXWsFeedHandler {
                             self.adjust_execution_report(report, &effective_client_id, &raw_child);
                         self.update_caches_with_report(&adjusted);
                         exec_reports.push(adjusted);
+                        observation.outcome = "external_report_forwarded".into();
                     }
-                    Err(e) => log::error!("Failed to parse order message: {e}"),
+                    Err(e) => {
+                        observation.outcome = "parse_error".into();
+                        log::error!("Failed to parse order message: {e}");
+                    }
                 }
             }
+            observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+            self.emit_request_observation(observation);
         }
 
         if !exec_reports.is_empty() {
@@ -1716,6 +1933,14 @@ impl OKXWsFeedHandler {
 
         match event {
             ParsedOrderEvent::Accepted(accepted) => {
+                // Only an orders-channel observation establishes confirmed terms.
+                // Seed even when the placement response already emitted acceptance.
+                self.update_order_state_cache(
+                    &canonical_client_id,
+                    msg,
+                    price_precision,
+                    size_precision,
+                );
                 if self.emitted_accepted.contains(&venue_order_id) {
                     log::debug!(
                         "Skipping duplicate OrderAccepted for venue_order_id={venue_order_id}"
@@ -1723,12 +1948,6 @@ impl OKXWsFeedHandler {
                     return;
                 }
                 self.emitted_accepted.add(venue_order_id);
-                self.update_order_state_cache(
-                    &canonical_client_id,
-                    msg,
-                    price_precision,
-                    size_precision,
-                );
 
                 self.pending_messages
                     .push_back(NautilusWsMessage::OrderAccepted(accepted));
@@ -1812,6 +2031,7 @@ impl OKXWsFeedHandler {
                 *client_order_id,
                 OrderStateSnapshot {
                     venue_order_id,
+                    ts_event: parse_millisecond_timestamp(msg.u_time),
                     quantity: qty,
                     price,
                 },
@@ -3016,6 +3236,7 @@ mod tests {
         handler.order_state_cache.insert(
             canonical,
             OrderStateSnapshot {
+                ts_event: UnixNanos::default(),
                 venue_order_id: venue_id,
                 quantity: Quantity::from("1.0"),
                 price: None,
@@ -3099,6 +3320,7 @@ mod tests {
     }
 
     mod channel_routing {
+        use crate::websocket::{handler::PendingOrderParams, messages::WsPostOrderParams};
         use ahash::AHashSet;
         use nautilus_core::nanos::UnixNanos;
         use nautilus_model::{
@@ -3260,6 +3482,196 @@ mod tests {
                     .handle_orders_data(payload["data"].clone(), UnixNanos::from(4000u64))
                     .is_none()
             );
+        }
+
+        #[rstest]
+        #[case(true)]
+        #[case(false)]
+        fn test_placement_response_seeds_later_amendments(
+            #[case] response_first: bool,
+            #[values(false, true)] saturated: bool,
+        ) {
+            let (mut handler, mut observations, _, _) = create_test_handler();
+            let instrument = create_swap_instrument();
+            handler
+                .instruments_cache
+                .insert(instrument.symbol().inner(), instrument);
+            if saturated {
+                handler.observations_emitted = 4097;
+            }
+            insert_pending_amend(&mut handler, "req-1");
+            let context = handler.pending_amend_requests.get("req-1").unwrap();
+            handler
+                .active_client_orders
+                .insert(context.0, (context.1, context.2, context.3));
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&load_test_json("ws_orders.json")).unwrap();
+            let item = &mut payload["data"][0];
+            for (key, value) in [
+                ("clOrdId", "TEST-ORDER"),
+                ("ordId", "12345"),
+                ("tradeId", ""),
+                ("state", "live"),
+                ("ordType", "limit"),
+                ("px", "100"),
+                ("sz", "1"),
+                ("accFillSz", "0"),
+                ("fillSz", "0"),
+                ("fillPx", ""),
+                ("fillTime", ""),
+                ("avgPx", ""),
+                ("fee", "0"),
+                ("cTime", "1000"),
+                ("uTime", "1000"),
+            ] {
+                item[key] = value.into();
+            }
+            let params: WsPostOrderParams = serde_json::from_value(serde_json::json!({
+                "instId":"BTC-USDT-SWAP", "tdMode":"cross", "side":"buy",
+                "ordType":"limit", "sz":"1", "px":"100", "clOrdId":"TEST-ORDER"
+            }))
+            .unwrap();
+            let context = handler.pending_amend_requests["req-1"].clone();
+            handler.pending_place_requests.insert(
+                "place-1".into(),
+                (
+                    PendingOrderParams::Regular(params),
+                    context.0,
+                    context.1,
+                    context.2,
+                    context.3,
+                ),
+            );
+            let placed = handler.handle_order_response(
+                Some("place-1".into()),
+                OKXWsOperation::Order,
+                "0".into(),
+                String::new(),
+                vec![serde_json::json!({"ordId":"12345","sCode":"0"})],
+                UnixNanos::from(900u64),
+            );
+            assert!(matches!(placed, Some(NautilusWsMessage::OrderAccepted(_))));
+            assert!(handler.order_state_cache.is_empty());
+            let initial =
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(1000u64));
+            assert!(initial.is_none());
+            let acknowledge = |handler: &mut OKXWsFeedHandler| {
+                assert!(
+                    handler
+                        .handle_order_response(
+                            Some("req-1".into()),
+                            OKXWsOperation::AmendOrder,
+                            "0".into(),
+                            String::new(),
+                            vec![serde_json::json!({"ordId":"12345","sCode":"0"})],
+                            UnixNanos::from(2000u64)
+                        )
+                        .is_none()
+                );
+            };
+            if response_first {
+                acknowledge(&mut handler);
+                assert_eq!(
+                    handler.order_state_cache[&ClientOrderId::new("TEST-ORDER")].quantity,
+                    Quantity::from("1")
+                );
+            }
+            payload["data"][0]["sz"] = "2".into();
+            payload["data"][0]["uTime"] = "2000".into();
+            let updated =
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(3000u64));
+            let Some(NautilusWsMessage::OrderUpdated(updated)) = updated else {
+                panic!("missing update")
+            };
+            let updated_id = updated.event_id.to_string();
+            if !response_first {
+                acknowledge(&mut handler);
+            }
+            assert_eq!(
+                handler.order_state_cache[&ClientOrderId::new("TEST-ORDER")].quantity,
+                Quantity::from("2")
+            );
+            assert!(handler.pending_amend_requests.is_empty());
+            payload["data"][0]["px"] = "110".into();
+            payload["data"][0]["uTime"] = "3000".into();
+            assert!(matches!(
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(3500u64)),
+                Some(NautilusWsMessage::OrderUpdated(_))
+            ));
+            assert!(
+                handler
+                    .handle_orders_data(payload["data"].clone(), UnixNanos::from(4000u64))
+                    .is_none()
+            );
+            // Older live terms must not regress the confirmed price or quantity.
+            payload["data"][0]["px"] = "90".into();
+            payload["data"][0]["uTime"] = "2000".into();
+            assert!(
+                handler
+                    .handle_orders_data(payload["data"].clone(), UnixNanos::from(5000u64))
+                    .is_none()
+            );
+            // An amendment and fill in the same push must deliver terms first.
+            for (key, value) in [
+                ("px", "120"),
+                ("sz", "3"),
+                ("state", "partially_filled"),
+                ("fillSz", "0.5"),
+                ("accFillSz", "0.5"),
+                ("fillPx", "120"),
+                ("tradeId", "42"),
+                ("fillTime", "4000"),
+                ("uTime", "4000"),
+            ] {
+                payload["data"][0][key] = value.into();
+            }
+            assert!(matches!(
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(6000u64)),
+                Some(NautilusWsMessage::OrderUpdated(_))
+            ));
+            assert!(matches!(
+                handler.pending_messages.pop_front(),
+                Some(NautilusWsMessage::ExecutionReports(_))
+            ));
+            handler.drain_pending_requests_on_reconnect();
+            for (key, value) in [
+                ("px", "130"),
+                ("uTime", "5000"),
+                ("fillSz", "0"),
+                ("tradeId", ""),
+                ("state", "live"),
+            ] {
+                payload["data"][0][key] = value.into();
+            }
+            assert!(matches!(
+                handler.handle_orders_data(payload["data"].clone(), UnixNanos::from(7000u64)),
+                Some(NautilusWsMessage::OrderUpdated(_))
+            ));
+            let mut diagnostics = Vec::new();
+            while let Ok(NautilusWsMessage::RequestObservation(item)) = observations.try_recv() {
+                diagnostics.push(item);
+            }
+            if !saturated {
+                let forwarded = diagnostics
+                    .iter()
+                    .find(|item| item.event_id.as_deref() == Some(&updated_id))
+                    .unwrap();
+                assert_eq!(forwarded.outcome, "updated_forwarded");
+                assert_eq!(forwarded.schema_version, 2);
+                assert_eq!(forwarded.ts_received_ns, Some(3000));
+                assert_eq!(forwarded.ts_venue_ns, Some(2_000_000_000));
+                assert!(forwarded.request_id.is_empty());
+                assert_eq!(forwarded.ts_handler_ns, 0);
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|item| item.outcome == "duplicate_accepted_seeded"
+                            && item.event_id.is_none())
+                );
+                assert!(diagnostics.iter().any(|item| item.outcome == "stale_or_duplicate" && item.event_id.is_none()));
+            } else {
+                assert!(handler.observations_dropped > 0);
+            }
         }
 
         #[rstest]
@@ -3578,7 +3990,8 @@ mod tests {
         #[rstest]
         fn test_pt_mixed_instrument_statuses() {
             let mut handler = create_handler_with_instruments(vec![]);
-            let value: serde_json::Value = serde_json::from_str(&load_test_json("ws_instruments.json")).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&load_test_json("ws_instruments.json")).unwrap();
             let cases = [
                 ("live", MarketStatusAction::Trading),
                 ("post_only", MarketStatusAction::Quoting),
@@ -3587,17 +4000,22 @@ mod tests {
                 ("preopen", MarketStatusAction::PreOpen),
                 ("test", MarketStatusAction::NotAvailableForTrading),
             ];
-            let rows: Vec<serde_json::Value> = cases.iter().enumerate().map(|(i, (wire, _))| {
-                let mut row = value["data"][0].clone();
-                row["instId"] = serde_json::json!(format!("TEST{i}-USDT-SWAP"));
-                row["state"] = serde_json::json!(wire);
-                row
-            }).collect();
-            let first = handler.handle_instruments_data(
-                serde_json::json!(rows), UnixNanos::from(1_000_000_000u64)
-            ).expect("Mixed array must decode");
+            let rows: Vec<serde_json::Value> = cases
+                .iter()
+                .enumerate()
+                .map(|(i, (wire, _))| {
+                    let mut row = value["data"][0].clone();
+                    row["instId"] = serde_json::json!(format!("TEST{i}-USDT-SWAP"));
+                    row["state"] = serde_json::json!(wire);
+                    row
+                })
+                .collect();
+            let first = handler
+                .handle_instruments_data(serde_json::json!(rows), UnixNanos::from(1_000_000_000u64))
+                .expect("Mixed array must decode");
             let messages: Vec<_> = std::iter::once(first)
-                .chain(handler.pending_messages.drain(..)).collect();
+                .chain(handler.pending_messages.drain(..))
+                .collect();
             assert_eq!(messages.len(), cases.len());
             for (i, (message, (wire, action))) in messages.into_iter().zip(cases).enumerate() {
                 let status = match message {
@@ -3605,7 +4023,10 @@ mod tests {
                     NautilusWsMessage::InstrumentStatus(status) => status,
                     other => panic!("Expected status, was {other:?}"),
                 };
-                assert_eq!(status.instrument_id.to_string(), format!("TEST{i}-USDT-SWAP.OKX"));
+                assert_eq!(
+                    status.instrument_id.to_string(),
+                    format!("TEST{i}-USDT-SWAP.OKX")
+                );
                 assert_eq!(status.action, action);
                 assert_eq!(status.is_trading, Some(wire == "live"));
             }
@@ -4141,6 +4562,13 @@ mod tests {
         );
         assert!(response.is_none());
         assert_eq!(handler.pending_amend_requests.len(), 1);
+        for expected in ["response_received", "response_unresolved"] {
+            let NautilusWsMessage::RequestObservation(observation) = out.try_recv().unwrap() else {
+                panic!()
+            };
+            assert_eq!(observation.outcome, expected);
+            assert!(observation.event_id.is_none());
+        }
         assert!(out.try_recv().is_err());
     }
 
@@ -4192,6 +4620,10 @@ mod tests {
             definitive
         );
         assert_eq!(handler.pending_amend_requests.is_empty(), definitive);
+        let NautilusWsMessage::RequestObservation(received) = out.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(received.outcome, "response_received");
         if definitive {
             let NautilusWsMessage::RequestObservation(observation) = out.try_recv().unwrap() else {
                 panic!()
@@ -4220,10 +4652,17 @@ mod tests {
                     .is_none()
             );
         }
-        let NautilusWsMessage::RequestObservation(observation) = out.try_recv().unwrap() else {
-            panic!()
-        };
-        assert_eq!(observation.outcome, "acknowledged");
+        for expected in [
+            "response_received",
+            "acknowledged",
+            "response_received",
+            "response_unmatched",
+        ] {
+            let NautilusWsMessage::RequestObservation(observation) = out.try_recv().unwrap() else {
+                panic!()
+            };
+            assert_eq!(observation.outcome, expected);
+        }
         assert!(out.try_recv().is_err());
         insert_pending_amend(&mut handler, "req-2");
         let event = handler.drain_pending_requests_on_reconnect();

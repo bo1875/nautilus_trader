@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from decimal import Decimal
 from typing import Any
 from typing import Final
+from typing import NamedTuple
 from typing import cast
 
 import pandas as pd
@@ -76,6 +77,7 @@ from nautilus_trader.model.enums import trigger_type_to_str
 from nautilus_trader.model.events import OrderEvent
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
+from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -91,6 +93,16 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders import OrderUnpacker
 from nautilus_trader.model.position import Position
+
+
+class OrderApplyObservation(NamedTuple):
+    """Local engine boundary, joined to transport diagnostics by event_id only."""
+
+    event_id: str
+    client_order_id: str
+    ts_observed_ns: int
+    outcome: str
+    observations_dropped: int
 
 
 class LiveExecutionEngine(ExecutionEngine):
@@ -149,6 +161,8 @@ class LiveExecutionEngine(ExecutionEngine):
         self._position_recon_retries: Counter[InstrumentId] = Counter()
         self._recent_fills_cache: dict[TradeId, int] = {}  # TradeId -> timestamp_ns (TTL cache)
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
+        self._apply_observations_emitted = 0
+        self._apply_observations_dropped = 0
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
         self._filtered_external_orders_count: int = 0
@@ -3131,10 +3145,27 @@ class LiveExecutionEngine(ExecutionEngine):
             return True  # Reconciled
 
         if report.order_status == OrderStatus.ACCEPTED:
-            if order.status != OrderStatus.ACCEPTED:
+            # A live snapshot confirms terms, not a new acceptance or the outcome
+            # of an outstanding request. Never reopen a terminal order.
+            if order.is_closed:
+                return True
+            if report.quantity < order.filled_qty:
+                return False
+            confirmed_ts = max(
+                (
+                    event.ts_event
+                    for event in order.events
+                    if isinstance(event, (OrderUpdated, OrderFilled))
+                ),
+                default=0,
+            )
+            if report.ts_last < confirmed_ts:
+                return True
+            if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
                 self._generate_order_accepted(order, report)
-
-            return True  # Reconciled
+            if self._should_update(order, report) and report.ts_last > confirmed_ts:
+                self._generate_order_updated(order, report)
+            return True
 
         # Order must have been accepted from this point
         if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
@@ -3571,8 +3602,33 @@ class LiveExecutionEngine(ExecutionEngine):
             self._ts_last_query.pop(client_order_id, None)
 
     def _handle_event_with_tracking(self, event: OrderEvent) -> None:
-        # Handle an order event with activity tracking, recording fills in cache and
-        # cleaning up tracking data for closed orders.
+        # Validate terms again at application: a fill or terminal event may have
+        # reached the engine after the adapter produced this update.
+        before_id = None
+        if isinstance(event, OrderUpdated):
+            order = self._cache.order(event.client_order_id)
+            if order is not None:
+                before_id = order.last_event.id
+                confirmed_ts = max(
+                    (
+                        item.ts_event
+                        for item in order.events
+                        if isinstance(item, (OrderUpdated, OrderFilled))
+                    ),
+                    default=0,
+                )
+                reason = None
+                if order.is_closed:
+                    reason = "terminal"
+                elif event.quantity < order.filled_qty:
+                    reason = "below_filled"
+                elif event.ts_event < confirmed_ts:
+                    reason = "stale"
+                elif before_id == event.id:
+                    reason = "duplicate"
+                if reason is not None:
+                    self._observe_order_apply(event, reason)
+                    return
         self._record_local_activity(event)
 
         if isinstance(event, OrderFilled):
@@ -3585,7 +3641,21 @@ class LiveExecutionEngine(ExecutionEngine):
                 if client_order_id not in self._inferred_fill_ts:
                     self._inferred_fill_ts[client_order_id] = event.ts_event
 
-        self._handle_event(event)
+        outcome = "error"
+        try:
+            self._handle_event(event)
+            if isinstance(event, OrderUpdated):
+                order = self._cache.order(event.client_order_id)
+                outcome = (
+                    "applied"
+                    if order is not None
+                    and order.last_event.id == event.id
+                    and before_id != event.id
+                    else "not_applied"
+                )
+        finally:
+            if isinstance(event, OrderUpdated):
+                self._observe_order_apply(event, outcome)
 
         if event.client_order_id is None:
             return
@@ -3596,6 +3666,29 @@ class LiveExecutionEngine(ExecutionEngine):
             self._order_local_activity_ns.pop(order.client_order_id, None)
             self._inferred_fill_ts.pop(order.client_order_id, None)
             self._fill_application_audit.pop(order.client_order_id, None)
+
+    def _observe_order_apply(self, event: OrderUpdated, outcome: str) -> None:
+        # No history retained. Subscribers must be nonblocking. Diagnostic failure
+        # cannot change order processing. The cap is per engine lifetime.
+        if self._apply_observations_emitted >= 4096:
+            self._apply_observations_dropped += 1
+            if self._apply_observations_dropped == 1:
+                self._log.warning("Order apply observation budget exhausted")
+            return
+        self._apply_observations_emitted += 1
+        try:
+            self._msgbus.publish(
+                topic="execution.order_apply_observation",
+                msg=OrderApplyObservation(
+                    str(event.id),
+                    str(event.client_order_id),
+                    self._clock.timestamp_ns(),
+                    outcome,
+                    self._apply_observations_dropped,
+                ),
+            )
+        except Exception:
+            self._apply_observations_dropped += 1
 
     def _record_local_activity(self, event: OrderEvent | None) -> None:
         if event is None:

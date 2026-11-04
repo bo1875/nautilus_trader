@@ -129,6 +129,7 @@ pub enum ParsedOrderEvent {
 /// Snapshot of order state for detecting updates.
 #[derive(Debug, Clone)]
 pub struct OrderStateSnapshot {
+    pub ts_event: UnixNanos,
     pub venue_order_id: VenueOrderId,
     pub quantity: Quantity,
     pub price: Option<Price>,
@@ -4280,6 +4281,7 @@ mod tests {
         let ts_init = UnixNanos::from(1000000000);
 
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4325,6 +4327,7 @@ mod tests {
         let strategy_id = StrategyId::new("STRATEGY-001");
         let ts_init = UnixNanos::from(1000000000);
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4600,6 +4603,7 @@ mod tests {
         let ts_init = UnixNanos::from(1000000000);
 
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4642,6 +4646,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4664,6 +4669,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"), // Old quantity
             price: Some(Price::from("50000.00")),
@@ -4686,6 +4692,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"), // Old venue ID
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4708,6 +4715,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
