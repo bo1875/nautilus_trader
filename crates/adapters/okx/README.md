@@ -69,6 +69,14 @@ capability. Without it, recovery remains required and the adapter logs the missi
 integration. A failed read sends no mass report; a reconnect during a read requires
 another pass. Report submission is not a settlement acknowledgement.
 
+Default recovery is admitted only within a connection lifecycle. Public disconnect
+closes admission before scheduling socket shutdown, preserves unresolved recovery,
+and cancels its current task. Socket callbacks retain their lifecycle identity;
+late reconnects cannot start recovery after close or enter a later lifecycle.
+Readbacks recheck that identity before submitting a report, even if a reader
+suppresses cancellation. A fresh connection opens a new lifecycle. Ordinary order
+events and observation hooks retain their existing dispatch during shutdown.
+
 Schema version 1 uses a random handler-lifetime `connection_id` and a generation
 incremented at reconnect. Up to 128 pending amend/cancel observations carry the
 native request ID, operation, order/instrument identities, requested venue-unit

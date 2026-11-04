@@ -15,6 +15,7 @@
 
 import asyncio
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 from nautilus_trader.adapters.okx.config import OKXExecClientConfig
@@ -194,6 +195,7 @@ class OKXExecutionClient(LiveExecutionClient):
         self._ws_client_futures: set[asyncio.Future] = set()
         self._ws_recovery_task: asyncio.Task | None = None
         self._ws_recovery_required = False
+        self._ws_recovery_lifecycle: object | None = None
 
         self._ws_business_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=nautilus_pyo3.get_okx_ws_url_business(config.is_demo),
@@ -244,6 +246,18 @@ class OKXExecutionClient(LiveExecutionClient):
             self._log.warning("Failed to query OKX server time")
 
     async def _connect(self) -> None:
+        lifecycle = object()
+        self._ws_recovery_lifecycle = lifecycle
+        try:
+            await self._connect_websockets(lifecycle)
+            if self._ws_recovery_lifecycle is not lifecycle:
+                raise asyncio.CancelledError
+        except BaseException:
+            if self._ws_recovery_lifecycle is lifecycle:
+                self._close_ws_recovery()
+            raise
+
+    async def _connect_websockets(self, lifecycle: object) -> None:
         await self._instrument_provider.initialize()
         await self._cache_instruments()
         await self._update_account_state()
@@ -256,7 +270,7 @@ class OKXExecutionClient(LiveExecutionClient):
         await self._ws_client.connect(
             loop_=self._loop,
             instruments=self.okx_instrument_provider.instruments_pyo3(),
-            callback=self._handle_msg,
+            callback=partial(self._handle_msg, recovery_lifecycle=lifecycle),
         )
         self._ws_client.cache_inst_id_codes(self.okx_instrument_provider.inst_id_codes())
 
@@ -273,7 +287,7 @@ class OKXExecutionClient(LiveExecutionClient):
         await self._ws_business_client.connect(
             loop_=self._loop,
             instruments=self.okx_instrument_provider.instruments_pyo3(),
-            callback=self._handle_msg,
+            callback=partial(self._handle_msg, recovery_lifecycle=lifecycle),
         )
 
         # Wait for connection to be established
@@ -346,7 +360,18 @@ class OKXExecutionClient(LiveExecutionClient):
 
         await self._ws_client.subscribe_account()
 
+    def disconnect(self) -> None:
+        # Fence admission synchronously, before the public wrapper schedules close.
+        self._close_ws_recovery()
+        super().disconnect()
+
+    def _close_ws_recovery(self) -> None:
+        self._ws_recovery_lifecycle = None
+        if self._ws_recovery_task is not None and not self._ws_recovery_task.done():
+            self._ws_recovery_required = True
+
     async def _disconnect(self) -> None:
+        self._close_ws_recovery()
         if self._ws_recovery_task is not None:
             self._ws_recovery_task.cancel()
             await asyncio.gather(self._ws_recovery_task, return_exceptions=True)
@@ -1766,13 +1791,25 @@ class OKXExecutionClient(LiveExecutionClient):
     def _is_external_order(self, client_order_id: ClientOrderId) -> bool:
         return not client_order_id or not self._cache.strategy_id_for_order(client_order_id)
 
-    def _handle_msg(self, msg: Any) -> None:  # noqa: C901 (too complex)
+    def _handle_msg(  # noqa: C901 (too complex)
+        self,
+        msg: Any,
+        *,
+        recovery_lifecycle: object | None = None,
+    ) -> None:
         if isinstance(msg, nautilus_pyo3.OKXWebSocketError):
             self._log.error(repr(msg))
             return
 
         try:
             if isinstance(msg, getattr(nautilus_pyo3, "OKXWebSocketReconnect", ())):
+                if (
+                    recovery_lifecycle is not None
+                    and recovery_lifecycle is not self._ws_recovery_lifecycle
+                ):
+                    if self._ws_recovery_lifecycle is None:
+                        self._ws_recovery_required = True
+                    return
                 self._handle_ws_reconnect(msg)
             elif isinstance(msg, getattr(nautilus_pyo3, "OKXRequestObservation", ())):
                 self._handle_ws_request_observation(msg)
@@ -1820,20 +1857,25 @@ class OKXExecutionClient(LiveExecutionClient):
             f"omitted={event.omitted_count}",
         )
         self._ws_recovery_required = True
+        lifecycle = self._ws_recovery_lifecycle
+        if lifecycle is None:
+            return
         if not getattr(self, "_mass_status_reports_complete", False):
             self._log.warning(
                 "Reconnect recovery requires a strict mass-report collector or recovery hook override",
             )
             return
         if self._ws_recovery_task is None or self._ws_recovery_task.done():
-            self._ws_recovery_task = self.create_task(self._recover_after_ws_reconnect())
+            self._ws_recovery_task = self.create_task(self._recover_after_ws_reconnect(lifecycle))
 
-    async def _recover_after_ws_reconnect(self) -> None:
+    async def _recover_after_ws_reconnect(self, lifecycle: object) -> None:
         # Coalesce bursts without dropping a reconnect arriving during a read.
-        while self._ws_recovery_required:
+        while self._ws_recovery_lifecycle is lifecycle and self._ws_recovery_required:
             self._ws_recovery_required = False
             try:
                 report = await self.generate_mass_status()
+                if self._ws_recovery_lifecycle is not lifecycle:
+                    return
                 if report is None:
                     self._ws_recovery_required = True
                     self._log.warning("Reconnect readback incomplete; recovery remains required")
@@ -1843,10 +1885,12 @@ class OKXExecutionClient(LiveExecutionClient):
                     msg=report,
                 )
             except asyncio.CancelledError:
-                self._ws_recovery_required = True
+                if self._ws_recovery_lifecycle is lifecycle:
+                    self._ws_recovery_required = True
                 raise
             except Exception as exc:
-                self._ws_recovery_required = True
+                if self._ws_recovery_lifecycle is lifecycle:
+                    self._ws_recovery_required = True
                 self._log.exception("Reconnect readback failed; recovery remains required", exc)
                 return
 

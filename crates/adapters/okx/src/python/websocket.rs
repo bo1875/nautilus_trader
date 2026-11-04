@@ -1297,6 +1297,7 @@ loop = asyncio.new_event_loop()
 client = OKXExecutionClient()
 client._ws_recovery_task = None
 client._ws_recovery_required = False
+client._ws_recovery_lifecycle = object()
 client._mass_status_reports_complete = True
 client._log = SimpleNamespace(warning=lambda *a: None, exception=lambda *a: None)
 client.create_task = loop.create_task
