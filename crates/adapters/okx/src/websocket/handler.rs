@@ -34,9 +34,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
+use super::capture::{
+    CaptureSlot, CaptureSnapshot, LIMIT, OKXCaptureStatus, WINDOW, close_capture,
+};
 use ahash::{AHashMap, AHashSet};
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
 use nautilus_common::cache::fifo::FifoCache;
 use nautilus_core::{AtomicTime, UUID4, nanos::UnixNanos, time::get_atomic_clock_realtime};
@@ -232,6 +237,11 @@ pub(super) struct OKXWsFeedHandler {
     connection_generation: u64,
     observations_emitted: usize,
     observations_dropped: u64,
+    observations_total: u64,
+    observation_window_start: Instant,
+    observation_window_date: u64,
+    capture_sequence: Arc<AtomicU64>,
+    pub(super) capture_state: CaptureSlot,
     active_client_orders: Arc<DashMap<ClientOrderId, (TraderId, StrategyId, InstrumentId)>>,
     client_id_aliases: Arc<DashMap<ClientOrderId, ClientOrderId>>,
     inst_id_code_cache: Arc<DashMap<Ustr, u64>>,
@@ -244,6 +254,13 @@ pub(super) struct OKXWsFeedHandler {
     funding_rate_cache: AHashMap<Ustr, (Ustr, u64)>, // Cache (funding_rate, funding_time) by inst_id
     last_account_state: Option<AccountState>,
     request_id_counter: Arc<AtomicU64>,
+}
+
+impl Drop for OKXWsFeedHandler {
+    fn drop(&mut self) {
+        self.publish_capture_state();
+        close_capture(&self.capture_state, Some(&self.connection_id));
+    }
 }
 
 impl OKXWsFeedHandler {
@@ -282,6 +299,11 @@ impl OKXWsFeedHandler {
             connection_generation: 0,
             observations_emitted: 0,
             observations_dropped: 0,
+            observations_total: 0,
+            observation_window_start: Instant::now(),
+            observation_window_date: get_atomic_clock_realtime().get_time_ns().as_u64(),
+            capture_sequence: Arc::new(AtomicU64::new(0)),
+            capture_state: Arc::new(ArcSwapOption::empty()),
             active_client_orders,
             client_id_aliases,
             inst_id_code_cache,
@@ -799,6 +821,9 @@ impl OKXWsFeedHandler {
         self.pending_mass_cancel_requests.clear();
         self.connection_generation += 1;
         self.observations_emitted = 0;
+        self.observation_window_start = Instant::now();
+        self.observation_window_date = ts_observed_ns;
+        self.publish_capture_state();
         let event = OKXWebSocketReconnect {
             schema_version: 1,
             connection_id: self.connection_id.clone(),
@@ -878,27 +903,72 @@ impl OKXWsFeedHandler {
         }
     }
 
-    fn emit_request_observation(&mut self, observation: OKXRequestObservation) {
-        // Bound diagnostic volume independently of critical lifecycle messages.
-        // This is a per-generation budget, not a bound on the shared output channel.
-        const OBSERVATION_LIMIT: usize = 4096;
-        if self.observations_emitted == OBSERVATION_LIMIT {
-            log::warn!(
-                "Request observation budget exhausted; further diagnostics omitted until reconnect"
-            );
-            self.observations_emitted += 1;
+    fn refresh_observation_window(&mut self) {
+        let windows = self.observation_window_start.elapsed().as_secs() / WINDOW.as_secs();
+        if windows > 0 {
+            let advance = std::time::Duration::from_secs(windows * WINDOW.as_secs());
+            self.observation_window_start += advance;
+            self.observation_window_date = self
+                .observation_window_date
+                .saturating_add(advance.as_nanos() as u64);
+            self.observations_emitted = 0;
         }
-        if self.observations_emitted > OBSERVATION_LIMIT {
-            self.observations_dropped = self.observations_dropped.saturating_add(1);
+    }
+
+    pub(super) fn publish_capture_state(&self) {
+        let snapshot = Arc::new(CaptureSnapshot {
+            status: OKXCaptureStatus {
+                schema_version: 1,
+                scope: "okx_transport".into(),
+                scope_id: self.connection_id.clone(),
+                connection_generation: Some(self.connection_generation),
+                ts_observed_ns: 0,
+                window_start_ns: self.observation_window_date,
+                window_duration_ns: WINDOW.as_nanos() as u64,
+                window_limit: LIMIT as u64,
+                window_attempts: self.observations_emitted.min(LIMIT) as u64,
+                total_attempts: self.observations_total,
+                observations_dropped: self.observations_dropped,
+                status_sequence: 0,
+                state: "active".into(),
+            },
+            window_start: self.observation_window_start,
+            sequence: self.capture_sequence.clone(),
+        });
+        self.capture_state.rcu(|current| {
+            if current.as_ref().is_some_and(|current| {
+                current.status.scope_id != self.connection_id || current.status.state == "closed"
+            }) {
+                current.clone()
+            } else {
+                Some(snapshot.clone())
+            }
+        });
+    }
+
+    fn emit_request_observation(&mut self, observation: OKXRequestObservation) {
+        if self
+            .capture_state
+            .load()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status.state == "closed")
+        {
             return;
         }
-        self.observations_emitted += 1;
-        if self
-            .send(NautilusWsMessage::RequestObservation(observation))
-            .is_err()
-        {
+        self.refresh_observation_window();
+        if self.observations_emitted >= LIMIT {
             self.observations_dropped = self.observations_dropped.saturating_add(1);
+        } else {
+            self.observations_emitted += 1;
+            self.observations_total = self.observations_total.saturating_add(1);
+            if self
+                .send(NautilusWsMessage::RequestObservation(observation))
+                .is_err()
+            {
+                self.observations_dropped = self.observations_dropped.saturating_add(1);
+            }
         }
+        self.publish_capture_state();
     }
 
     fn observe_send_completed(&mut self, request_id: &str) {
@@ -3611,6 +3681,24 @@ mod tests {
                     .handle_orders_data(payload["data"].clone(), UnixNanos::from(5000u64))
                     .is_none()
             );
+            if saturated {
+                let exhausted =
+                    super::super::super::capture::read_capture(&handler.capture_state).unwrap();
+                assert_eq!(exhausted.state, "exhausted");
+                assert!(exhausted.observations_dropped > 0);
+                // Diagnostic time advances without reconnect/restart. Getter
+                // projection cannot independently refill the real budget.
+                handler.observation_window_start -= std::time::Duration::from_secs(60);
+                handler.observation_window_date -= 60_000_000_000;
+                handler.publish_capture_state();
+                for _ in 0..2 {
+                    let status =
+                        super::super::super::capture::read_capture(&handler.capture_state).unwrap();
+                    assert_eq!(status.window_attempts, 0);
+                    assert_eq!(status.state, "active");
+                    assert_eq!(handler.observations_emitted, 4097);
+                }
+            }
             // An amendment and fill in the same push must deliver terms first.
             for (key, value) in [
                 ("px", "120"),
@@ -3671,6 +3759,13 @@ mod tests {
                 assert!(diagnostics.iter().any(|item| item.outcome == "stale_or_duplicate" && item.event_id.is_none()));
             } else {
                 assert!(handler.observations_dropped > 0);
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|item| item.outcome == "updated_forwarded"
+                            && item.ts_received_ns == Some(6000)
+                            && item.event_id.is_some())
+                );
             }
         }
 
@@ -4398,6 +4493,134 @@ mod tests {
 
             // Should return None when instrument is not in cache
             assert!(result.is_none());
+        }
+    }
+
+    #[rstest]
+    fn test_capture_status_survives_exhaustion_failure_reconnect_and_close() {
+        use crate::websocket::{capture::read_capture, client::OKXWebSocketClient};
+        let (mut handler, mut out, _, _) = create_test_handler();
+        let mut client = OKXWebSocketClient::default();
+        assert!(client.capture_status().is_none());
+        client.capture_state = handler.capture_state.clone();
+        insert_pending_amend(&mut handler, "req-status");
+        let observation = handler.pending_amend_requests["req-status"].5.clone();
+        handler.observations_emitted = 4095;
+        handler.observations_total = 4095;
+        for _ in 0..3 {
+            handler.emit_request_observation(observation.clone());
+        }
+        assert!(matches!(
+            out.try_recv(),
+            Ok(NautilusWsMessage::RequestObservation(_))
+        ));
+        assert!(out.try_recv().is_err());
+        let status = client.capture_status().unwrap();
+        assert_eq!(status.state, "exhausted");
+        assert_eq!(status.total_attempts, 4096);
+        assert_eq!(status.observations_dropped, 2);
+        let coherent = handler.capture_state.load_full().unwrap();
+        for date in [1, u64::MAX, 2] {
+            let dated = coherent.read(std::time::Instant::now(), date);
+            assert_eq!(dated.window_attempts, 4096);
+            assert_eq!(dated.window_start_ns, status.window_start_ns);
+            assert_eq!(dated.ts_observed_ns, date);
+            assert_eq!(handler.observations_emitted, 4096);
+        }
+        let generation = status.connection_generation;
+        handler.observation_window_start -= std::time::Duration::from_secs(60);
+        handler.observation_window_date -= 60_000_000_000;
+        handler.publish_capture_state();
+        let expired = client.capture_status().unwrap();
+        assert_eq!(expired.window_attempts, 0);
+        assert_eq!(handler.observations_emitted, 4096);
+        handler.emit_request_observation(observation.clone());
+        let current = client.capture_status().unwrap();
+        assert_eq!(current.window_attempts, 1);
+        assert_eq!(current.total_attempts, 4097);
+        assert_eq!(current.observations_dropped, 2);
+        assert_eq!(current.connection_generation, generation);
+        drop(out);
+        handler.emit_request_observation(observation.clone());
+        let failed = client.capture_status().unwrap();
+        assert_eq!(failed.total_attempts, 4098);
+        assert_eq!(failed.observations_dropped, 3);
+        handler.drain_pending_requests_on_reconnect();
+        let reconnected = client.capture_status().unwrap();
+        assert_eq!(reconnected.scope_id, status.scope_id);
+        assert_eq!(reconnected.connection_generation, Some(1));
+        assert_eq!(reconnected.window_attempts, 0);
+        assert_eq!(reconnected.observations_dropped, 3);
+        assert!(reconnected.status_sequence > status.status_sequence);
+        let slot = handler.capture_state.clone();
+        drop(handler);
+        let closed = read_capture(&slot).unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(client.capture_status().unwrap(), closed);
+        assert_eq!(client.capture_status().unwrap(), closed);
+
+        #[cfg(feature = "python")]
+        {
+            use pyo3::prelude::*;
+            Python::initialize();
+            Python::attach(|py| {
+                let client = Py::new(py, client).unwrap();
+                let status = client.call_method0(py, "capture_status").unwrap();
+                assert_eq!(
+                    status
+                        .getattr(py, "observations_dropped")
+                        .unwrap()
+                        .extract::<u64>(py)
+                        .unwrap(),
+                    3
+                );
+                assert_eq!(
+                    status
+                        .getattr(py, "state")
+                        .unwrap()
+                        .extract::<String>(py)
+                        .unwrap(),
+                    "closed"
+                );
+                assert!(status.setattr(py, "state", "active").is_err());
+                let globals = pyo3::types::PyDict::new(py);
+                globals.set_item("native_client", client.bind(py)).unwrap();
+                globals
+                    .set_item(
+                        "source",
+                        include_str!("../../../../../nautilus_trader/adapters/okx/execution.py"),
+                    )
+                    .unwrap();
+                py.run(&std::ffi::CString::new(r#"
+import ast
+from typing import Any
+from types import SimpleNamespace
+cls = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == "OKXExecutionClient")
+cls.bases = []
+cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {"_offer_ws_capture_status", "_handle_ws_capture_status"}]
+exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "consumer.py", "exec"))
+consumer = OKXExecutionClient()
+consumer._ws_client = native_client
+consumer._ws_business_client = SimpleNamespace(capture_status=lambda: None)
+consumer._ws_capture_closed = {}
+consumer._ws_capture_status_failures = 0
+rows = []
+consumer._handle_ws_capture_status = rows.append
+consumer._offer_ws_capture_status()
+consumer._offer_ws_capture_status()
+assert len(rows) == 1
+assert rows[0].observations_dropped == 3 and rows[0].state == "closed"
+assert consumer._ws_capture_status_failures == 0
+"#).unwrap(), Some(&globals), None).unwrap();
+                assert_eq!(
+                    status
+                        .getattr(py, "status_sequence")
+                        .unwrap()
+                        .extract::<u64>(py)
+                        .unwrap(),
+                    closed.status_sequence
+                );
+            });
         }
     }
 

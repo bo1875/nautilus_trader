@@ -20,6 +20,7 @@ from asyncio import Queue
 from collections import Counter
 from collections.abc import Iterable
 from decimal import Decimal
+from time import monotonic_ns
 from typing import Any
 from typing import Final
 from typing import NamedTuple
@@ -105,6 +106,30 @@ class OrderApplyObservation(NamedTuple):
     observations_dropped: int
 
 
+class ExecutionCaptureStatus(NamedTuple):
+    """Dated producer counters, not trading success or delivery certification."""
+
+    schema_version: int
+    scope: str
+    scope_id: str
+    connection_generation: int | None
+    ts_observed_ns: int
+    window_start_ns: int
+    window_duration_ns: int
+    window_limit: int
+    window_attempts: int
+    total_attempts: int
+    observations_dropped: int
+    status_sequence: int
+    state: str
+
+
+_CAPTURE_WINDOW_NS = 60_000_000_000
+_CAPTURE_LIMIT = 4096
+_CAPTURE_STATUS_SECS = 5.0
+_CAPTURE_COUNTER_MAX = (1 << 64) - 1
+
+
 class LiveExecutionEngine(ExecutionEngine):
     """
     Provides a high-performance asynchronous live execution engine.
@@ -163,6 +188,15 @@ class LiveExecutionEngine(ExecutionEngine):
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
         self._apply_observations_emitted = 0
         self._apply_observations_dropped = 0
+        self._apply_observations_total = 0
+        self._capture_scope_id = str(UUID4())
+        self._capture_window_mono = monotonic_ns()
+        self._capture_window_date = self._clock.timestamp_ns()
+        self._capture_status_sequence = 0
+        self._capture_status_failures = 0
+        self._capture_status_handle: asyncio.TimerHandle | None = None
+        self._capture_run: object | None = None
+        self._capture_closed_status: ExecutionCaptureStatus | None = None
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
         self._filtered_external_orders_count: int = 0
@@ -393,7 +427,11 @@ class LiveExecutionEngine(ExecutionEngine):
         self._is_shutting_down = False
 
         self._cmd_queue_task = self._loop.create_task(self._run_cmd_queue(), name="cmd_queue")
-        self._evt_queue_task = self._loop.create_task(self._run_evt_queue(), name="evt_queue")
+        self._start_capture_status()
+        self._evt_queue_task = self._loop.create_task(
+            self._run_evt_queue(self._capture_run),
+            name="evt_queue",
+        )
         self._log.debug(f"Scheduled task '{self._cmd_queue_task.get_name()}'")
         self._log.debug(f"Scheduled task '{self._evt_queue_task.get_name()}'")
 
@@ -474,6 +512,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
     def _on_stop(self) -> None:
         self._is_shutting_down = True
+        self._cancel_capture_status_timer()
 
         if self._reconciliation_task:
             self._log.debug(f"Canceling task '{self._reconciliation_task.get_name()}'")
@@ -527,6 +566,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.warning("Killing engine")
         self._kill = True
         self.stop()
+        self._close_capture_status(self._capture_run)
 
         if self._cmd_queue_task:
             self._log.debug(f"Canceling task '{self._cmd_queue_task.get_name()}'")
@@ -597,7 +637,7 @@ class LiveExecutionEngine(ExecutionEngine):
             else:
                 self._log.debug(stopped_msg)
 
-    async def _run_evt_queue(self) -> None:
+    async def _run_evt_queue(self, capture_run: object | None = None) -> None:
         self._log.debug(
             f"Event message queue processing starting (qsize={self.evt_qsize()})",
         )
@@ -615,6 +655,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 except Exception as e:
                     self._handle_queue_exception(e, "event")
         finally:
+            self._close_capture_status(capture_run)
             stopped_msg = "Event message queue stopped"
 
             if not self._evt_queue.empty():
@@ -3667,15 +3708,96 @@ class LiveExecutionEngine(ExecutionEngine):
             self._inferred_fill_ts.pop(order.client_order_id, None)
             self._fill_application_audit.pop(order.client_order_id, None)
 
+    def _refresh_capture_window(self) -> None:
+        if self._capture_closed_status is not None:
+            return
+        elapsed = max(0, monotonic_ns() - self._capture_window_mono)
+        windows = elapsed // _CAPTURE_WINDOW_NS
+        if windows:
+            advance = windows * _CAPTURE_WINDOW_NS
+            self._capture_window_mono += advance
+            self._capture_window_date += advance
+            self._apply_observations_emitted = 0
+
+    def _capture_status(self) -> ExecutionCaptureStatus:
+        if self._capture_closed_status is not None:
+            return self._capture_closed_status
+        self._refresh_capture_window()
+        self._capture_status_sequence = min(_CAPTURE_COUNTER_MAX, self._capture_status_sequence + 1)
+        return ExecutionCaptureStatus(
+            1,
+            "native_apply",
+            self._capture_scope_id,
+            None,
+            self._clock.timestamp_ns(),
+            self._capture_window_date,
+            _CAPTURE_WINDOW_NS,
+            _CAPTURE_LIMIT,
+            self._apply_observations_emitted,
+            self._apply_observations_total,
+            self._apply_observations_dropped,
+            self._capture_status_sequence,
+            "exhausted" if self._apply_observations_emitted >= _CAPTURE_LIMIT else "active",
+        )
+
+    def _publish_capture_status(self, status: ExecutionCaptureStatus) -> None:
+        try:
+            self._msgbus.publish(topic="execution.capture_status", msg=status)
+        except Exception:
+            self._capture_status_failures = min(
+                _CAPTURE_COUNTER_MAX, self._capture_status_failures + 1
+            )
+
+    def _cancel_capture_status_timer(self) -> None:
+        if self._capture_status_handle is not None:
+            self._capture_status_handle.cancel()
+            self._capture_status_handle = None
+
+    def _start_capture_status(self) -> None:
+        self._cancel_capture_status_timer()
+        if self._capture_run is None or self._capture_closed_status is not None:
+            self._capture_window_mono = monotonic_ns()
+            self._capture_window_date = self._clock.timestamp_ns()
+            self._apply_observations_emitted = 0
+        self._capture_closed_status = None
+        self._capture_run = object()
+        self._capture_status_tick(self._capture_run)
+
+    def _capture_status_tick(self, capture_run: object) -> None:
+        if capture_run is not self._capture_run or self._is_shutting_down:
+            return
+        self._capture_status_handle = None
+        self._publish_capture_status(self._capture_status())
+        # One handle, scheduled after the offer. No catch-up or per-event work.
+        if capture_run is self._capture_run and not self._is_shutting_down:
+            self._capture_status_handle = self._loop.call_later(
+                _CAPTURE_STATUS_SECS,
+                self._capture_status_tick,
+                capture_run,
+            )
+
+    def _close_capture_status(self, capture_run: object | None) -> None:
+        if capture_run is not self._capture_run or self._capture_closed_status is not None:
+            return
+        self._cancel_capture_status_timer()
+        self._capture_closed_status = self._capture_status()._replace(state="closed")
+        self._publish_capture_status(self._capture_closed_status)
+
     def _observe_order_apply(self, event: OrderUpdated, outcome: str) -> None:
-        # No history retained. Subscribers must be nonblocking. Diagnostic failure
-        # cannot change order processing. The cap is per engine lifetime.
-        if self._apply_observations_emitted >= 4096:
-            self._apply_observations_dropped += 1
-            if self._apply_observations_dropped == 1:
-                self._log.warning("Order apply observation budget exhausted")
+        # Capture failure never changes order processing. Subscribers must enqueue
+        # without blocking. The window replenishes independently of reconnect.
+        if self._capture_closed_status is not None:
+            return
+        self._refresh_capture_window()
+        if self._apply_observations_emitted >= _CAPTURE_LIMIT:
+            self._apply_observations_dropped = min(
+                _CAPTURE_COUNTER_MAX, self._apply_observations_dropped + 1
+            )
             return
         self._apply_observations_emitted += 1
+        self._apply_observations_total = min(
+            _CAPTURE_COUNTER_MAX, self._apply_observations_total + 1
+        )
         try:
             self._msgbus.publish(
                 topic="execution.order_apply_observation",
@@ -3688,7 +3810,9 @@ class LiveExecutionEngine(ExecutionEngine):
                 ),
             )
         except Exception:
-            self._apply_observations_dropped += 1
+            self._apply_observations_dropped = min(
+                _CAPTURE_COUNTER_MAX, self._apply_observations_dropped + 1
+            )
 
     def _record_local_activity(self, event: OrderEvent | None) -> None:
         if event is None:

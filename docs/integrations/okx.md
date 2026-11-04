@@ -696,13 +696,49 @@ Other outcomes are `not_applied`, `error`, `stale`, `terminal`, `below_filled`, 
 `duplicate`. Subscribers must enqueue without blocking. Subscriber errors do
 not change lifecycle processing. No correlation history is retained.
 
-Transport diagnostics share the existing 4,096-attempt budget per connection
-generation; reconnect detail remains capped at 128. Engine apply diagnostics
-have a separate 4,096-attempt budget per engine lifetime. After saturation the
-engine retains `_apply_observations_dropped` for inspection and warns once;
-there are no later payloads promising a final loss count. These counts describe
-refused/failed diagnostic attempts, not lost acknowledgements. Existing queues
-remain unbounded; neither budget bounds process memory or certifies coverage.
+Ordinary transport and engine apply diagnostics each admit 4,096 publication
+attempts per monotonic 60-second window. They resume without reconnect or
+restart. Reconnect also opens a transport window; engine windows are independent.
+Cumulative refused/failed attempts never reset at rollover or reconnect.
+Reconnect details remain capped at 128. Existing output queues remain unbounded;
+these limits do not bound process memory or certify complete coverage.
+
+Independent capture status remains available after ordinary event exhaustion.
+`OKXWebSocketClient.capture_status()` reads one latest immutable
+`OKXCaptureStatus` without queueing messages or doing network I/O. The Python
+execution client offers it through `_handle_ws_capture_status` every five
+seconds. The engine publishes `ExecutionCaptureStatus` on
+`execution.capture_status` with the same cadence. Each owner uses one lifecycle
+timer, rescheduled after its callback: delayed callbacks coalesce, without
+catch-up tasks. Subscribers must enqueue without blocking. Status failures are
+separate from ordinary refused counts and cannot change lifecycle processing.
+
+Both immutable status types expose these scalar fields:
+
+| Fields | Meaning |
+|---|---|
+| `schema_version`, `scope`, `scope_id` | Version 1; `okx_transport` handler identity or `native_apply` engine identity. |
+| `connection_generation` | Transport reconnect generation; `None` for the engine. |
+| `ts_observed_ns`, `window_start_ns` | Local UNIX snapshot date and diagnostic window opening date. Retention must preserve the original snapshot date. |
+| `window_duration_ns`, `window_limit`, `window_attempts` | 60-second duration, 4,096 limit, admitted attempts in the current window. |
+| `total_attempts`, `observations_dropped` | Scope-cumulative admitted publication attempts and refused/failed ordinary attempts. Local emission failure contributes to both; they are not a conservation equation. |
+| `status_sequence`, `state` | Prepared snapshot sequence and `active`, `exhausted`, or `closed`. Neither sequence nor active state certifies delivery. |
+
+Budget rollover uses monotonic elapsed time; changing the wall clock does not
+renew capacity. Window dates follow that monotonic window's original wall-clock
+anchor, so a wall-clock adjustment can put a window date ahead of a snapshot
+date. Getter reads cannot grant additional capacity. A current zero-attempt
+window describes only what this producer observed; an old or missing status
+cannot establish current availability or absence of trading events.
+
+Stop cancels periodic capture. The engine's existing event-queue finalizer
+freezes one closed snapshot after drain or cancellation; kill closes capture
+without asserting a successful drain. Transport close likewise freezes its
+final snapshot. Later reads preserve that date and sequence. Reusing an engine
+through its normal reset/start lifecycle preserves scope identity, cumulative
+counters and sequence, while opening a new window and retaining only one timer.
+A new engine or handler has a new scope. Closed status is not trading success,
+persistence, settlement, or tick-to-native invocation coverage.
 
 These changes build on the request/reconnect contract in PR #3. Automatic native
 reconnect readback additionally requires the strict all-reader completeness

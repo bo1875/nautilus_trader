@@ -88,6 +88,7 @@ pub fn okx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<super::websocket::messages::OKXWebSocketError>()?;
     m.add_class::<super::websocket::messages::OKXWebSocketReconnect>()?;
     m.add_class::<super::websocket::messages::OKXRequestObservation>()?;
+    m.add_class::<super::websocket::capture::OKXCaptureStatus>()?;
     m.add_class::<super::http::OKXHttpClient>()?;
     m.add_class::<crate::http::models::OKXBalanceDetail>()?;
     m.add_class::<crate::common::enums::OKXInstrumentType>()?;

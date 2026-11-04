@@ -120,6 +120,11 @@ impl OKXWebSocketClient {
         .map_err(to_pyvalue_err)
     }
 
+    #[pyo3(name = "capture_status")]
+    fn py_capture_status(&self) -> Option<crate::websocket::capture::OKXCaptureStatus> {
+        self.capture_status()
+    }
+
     #[staticmethod]
     #[pyo3(name = "with_credentials")]
     #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None))]

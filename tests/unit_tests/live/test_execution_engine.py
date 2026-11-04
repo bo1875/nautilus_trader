@@ -1650,7 +1650,14 @@ class TestLiveExecutionEngine:
             instrument=AUDUSD_SIM,
             last_qty=Quantity.from_int(120),
             trade_id=TradeId("AMENDED-FILL"),
+            commission=Money(1.25, USD),
         )
+        self.exec_engine._apply_observations_emitted = 4096
+        self.exec_engine._apply_observations_total = 4096
+        self.exec_engine._apply_observations_dropped = 2
+        self.exec_engine._capture_window_mono -= 60_000_000_000
+        observations = []
+        self.msgbus.subscribe("execution.order_apply_observation", observations.append)
         self.exec_engine.process(updated)
         self.exec_engine.process(fill)
         await eventually(lambda: order.filled_qty == Quantity.from_int(120))
@@ -1661,3 +1668,132 @@ class TestLiveExecutionEngine:
         await eventually(lambda: self.exec_engine.event_count >= 3)
         assert order.event_count == count
         assert order.filled_qty == Quantity.from_int(120)
+        assert order.commissions() == [Money(1.25, USD)]
+        assert observations[0].event_id == str(updated.id)
+        assert observations[0].observations_dropped == 2
+        assert self.exec_engine._capture_status().total_attempts == 4097
+
+    @pytest.mark.asyncio
+    async def test_capture_status_survives_ordinary_apply_budget_exhaustion(self):
+        order = self.order_factory.limit(
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order))
+        order.apply(TestEventStubs.order_accepted(order))
+        self.cache.update_order(order)
+        statuses = []
+        observations = []
+        self.msgbus.subscribe("execution.capture_status", statuses.append)
+        self.msgbus.subscribe("execution.order_apply_observation", observations.append)
+        self.exec_engine._apply_observations_emitted = 4095
+        self.exec_engine._apply_observations_total = 4095
+        for i in range(3):
+            event = TestEventStubs.order_updated(
+                order,
+                quantity=Quantity.from_int(110 + i),
+                ts_event=100 + i,
+            )
+            self.exec_engine._handle_event_with_tracking(event)
+            assert order.last_event.id == event.id
+        assert len(observations) == 1
+        assert observations[-1].observations_dropped == 0
+        assert self.exec_engine._apply_observations_dropped == 2
+        await asyncio.sleep(5.1)
+        assert statuses, "Independent status must report current loss after ordinary capture stops"
+        assert statuses[-1].observations_dropped == 2
+        assert statuses[-1].state == "exhausted"
+        assert order.quantity == Quantity.from_int(112)
+
+    @pytest.mark.asyncio
+    async def test_capture_rollover_status_failure_and_restart_preserve_scope(self, monkeypatch):
+        import nautilus_trader.live.execution_engine as module
+
+        engine = self.exec_engine
+        now = [engine._capture_window_mono]
+        monkeypatch.setattr(module, "monotonic_ns", lambda: now[0])
+        engine._apply_observations_emitted = 4096
+        engine._apply_observations_total = 4096
+        engine._apply_observations_dropped = 2
+        initial = engine._capture_status()
+        assert initial.state == "exhausted"
+        now[0] += 60_000_000_000
+        rolled = engine._capture_status()
+        assert rolled.window_attempts == 0
+        assert rolled.total_attempts == 4096
+        assert rolled.observations_dropped == 2
+        assert rolled.window_start_ns == initial.window_start_ns + 60_000_000_000
+        self.test_accepted_report_updates_confirmed_terms(False)
+        after = engine._capture_status()
+        assert after.window_attempts == 1
+        assert after.total_attempts == 4097
+        assert engine._capture_status().window_attempts == 1
+
+        def fail(_):
+            raise RuntimeError("synthetic status sink failure")
+
+        self.msgbus.subscribe("execution.capture_status", fail)
+        # Execute the actual scheduled callback, coalescing a delayed deadline.
+        engine._capture_status_handle.cancel()
+        engine._capture_status_tick(engine._capture_run)
+        assert engine._capture_status_failures == 1
+        assert engine._apply_observations_dropped == 2
+        assert engine._capture_status_handle is not None
+        handle = engine._capture_status_handle
+        run = engine._capture_run
+        engine.stop()
+        assert handle.cancelled()
+        await engine._evt_queue_task
+        closed = engine._capture_status()
+        assert closed.state == "closed"
+        now[0] += 120_000_000_000
+        assert engine._capture_status() == closed
+        assert engine._capture_status_handle is None
+        engine.reset()  # Component FSM requires reset before a new start.
+        engine.start()
+        restarted = engine._capture_status()
+        assert restarted.scope_id == initial.scope_id
+        assert restarted.total_attempts == 4097
+        assert restarted.observations_dropped == 2
+        assert restarted.status_sequence > closed.status_sequence
+        assert restarted.window_attempts == 0
+        handle = engine._capture_status_handle
+        engine._close_capture_status(run)  # Late finalizer cannot close the new run.
+        assert engine._capture_status_handle is handle
+        engine._start_capture_status()  # Duplicate start keeps only one handle.
+        assert handle.cancelled()
+        assert engine._capture_status_handle is not handle
+        engine.kill()
+        assert engine._capture_status_handle is None
+        assert engine._capture_status().state == "closed"
+
+    def test_capture_wall_clock_changes_do_not_replenish_budget(self, monkeypatch):
+        import nautilus_trader.live.execution_engine as module
+        from nautilus_trader.common.component import TestClock
+
+        now = [1_000_000_000]
+        monkeypatch.setattr(module, "monotonic_ns", lambda: now[0])
+        clock = TestClock()
+        clock.set_time(100_000_000_000)
+        bus = MessageBus(trader_id=self.trader_id, clock=clock)
+        engine = LiveExecutionEngine(loop=self.loop, msgbus=bus, cache=self.cache, clock=clock)
+        self._engines_to_cleanup.append(engine)
+        engine.start()
+        engine._apply_observations_emitted = 4096
+        engine._apply_observations_total = 4096
+        first = engine._capture_status()
+        for date in [1, 900_000_000_000, 2]:
+            clock.set_time(date)
+            status = engine._capture_status()
+            assert status.window_start_ns == first.window_start_ns
+            assert status.window_attempts == 4096
+            assert status.ts_observed_ns == date
+            assert status.state == "exhausted"
+        now[0] += 60_000_000_000
+        status = engine._capture_status()
+        assert status.window_attempts == 0
+        assert status.total_attempts == 4096
+        assert status.window_start_ns == first.window_start_ns + 60_000_000_000

@@ -197,6 +197,10 @@ class OKXExecutionClient(LiveExecutionClient):
         self._ws_recovery_required = False
         self._ws_recovery_lifecycle: object | None = None
         self._ws_recovery_requested_lifecycle: object | None = None
+        self._ws_capture_status_handle: asyncio.TimerHandle | None = None
+        self._ws_capture_status_running = False
+        self._ws_capture_status_failures = 0
+        self._ws_capture_closed: dict[int, tuple[str, int]] = {}
 
         self._ws_business_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=nautilus_pyo3.get_okx_ws_url_business(config.is_demo),
@@ -360,6 +364,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 )
 
         await self._ws_client.subscribe_account()
+        self._start_ws_capture_status()
 
     def disconnect(self) -> None:
         # Fence admission synchronously, before the public wrapper schedules close.
@@ -374,43 +379,50 @@ class OKXExecutionClient(LiveExecutionClient):
 
     async def _disconnect(self) -> None:
         self._close_ws_recovery()
-        if self._ws_recovery_task is not None:
-            self._ws_recovery_task.cancel()
-            await asyncio.gather(self._ws_recovery_task, return_exceptions=True)
+        self._ws_capture_status_running = False
+        if self._ws_capture_status_handle is not None:
+            self._ws_capture_status_handle.cancel()
+            self._ws_capture_status_handle = None
+        try:
+            if self._ws_recovery_task is not None:
+                self._ws_recovery_task.cancel()
+                await asyncio.gather(self._ws_recovery_task, return_exceptions=True)
 
-        # Shutdown websocket
-        if not self._ws_client.is_closed():
-            self._log.info("Disconnecting websocket")
+            # Shutdown websocket
+            if not self._ws_client.is_closed():
+                self._log.info("Disconnecting websocket")
 
-            await self._ws_client.close()
+                await self._ws_client.close()
 
-        # Shutdown business websocket
-        if not self._ws_business_client.is_closed():
-            self._log.info("Disconnecting business websocket")
+            # Shutdown business websocket
+            if not self._ws_business_client.is_closed():
+                self._log.info("Disconnecting business websocket")
 
-            await self._ws_business_client.close()
+                await self._ws_business_client.close()
 
-            self._log.info(f"Disconnected from {self._ws_client.url}", LogColor.BLUE)
+                self._log.info(f"Disconnected from {self._ws_client.url}", LogColor.BLUE)
 
-        self._http_client.cancel_all_requests()
+            self._http_client.cancel_all_requests()
 
-        # Cancel any pending futures
-        all_futures = self._ws_client_futures | self._ws_business_client_futures
-        for future in all_futures:
-            if not future.done():
-                future.cancel()
+            # Cancel any pending futures
+            all_futures = self._ws_client_futures | self._ws_business_client_futures
+            for future in all_futures:
+                if not future.done():
+                    future.cancel()
 
-        if all_futures:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*all_futures, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except TimeoutError:
-                self._log.warning("Timeout while waiting for websockets shutdown to complete")
+            if all_futures:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*all_futures, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except TimeoutError:
+                    self._log.warning("Timeout while waiting for websockets shutdown to complete")
 
-        self._ws_client_futures.clear()
-        self._ws_business_client_futures.clear()
+            self._ws_client_futures.clear()
+            self._ws_business_client_futures.clear()
+        finally:
+            self._offer_ws_capture_status(closed_only=True)
 
     async def _cache_instruments(self) -> None:
         # Ensures instrument definitions are available for correct
@@ -1841,6 +1853,45 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._log.debug(f"Received unhandled message type: {type(msg)}")
         except Exception as e:
             self._log.exception("Error handling websocket message", e)
+
+    def _handle_ws_capture_status(self, status: Any) -> None:
+        # Independent dated capture counters; never an order/recovery outcome.
+        pass
+
+    def _start_ws_capture_status(self) -> None:
+        if self._ws_capture_status_handle is not None:
+            self._ws_capture_status_handle.cancel()
+        self._ws_capture_status_running = True
+        self._ws_capture_status_tick()
+
+    def _ws_capture_status_tick(self) -> None:
+        if not self._ws_capture_status_running:
+            return
+        self._ws_capture_status_handle = None
+        self._offer_ws_capture_status()
+        if self._ws_capture_status_running and self._ws_capture_status_handle is None:
+            self._ws_capture_status_handle = self._loop.call_later(
+                5.0, self._ws_capture_status_tick
+            )
+
+    def _offer_ws_capture_status(self, closed_only: bool = False) -> None:
+        # Fixed two-client latest-closed markers, no operation/event history.
+        for index, client in enumerate((self._ws_client, self._ws_business_client)):
+            try:
+                getter = getattr(client, "capture_status", None)
+                status = getter() if getter is not None else None
+                if status is None or (closed_only and status.state != "closed"):
+                    continue
+                if status.state == "closed":
+                    key = (status.scope_id, status.status_sequence)
+                    if self._ws_capture_closed.get(index) == key:
+                        continue
+                    self._ws_capture_closed[index] = key
+                self._handle_ws_capture_status(status)
+            except Exception:
+                self._ws_capture_status_failures = min(
+                    (1 << 64) - 1, self._ws_capture_status_failures + 1
+                )
 
     def _handle_ws_request_observation(self, observation: Any) -> None:
         # Extension hook for transport diagnostics. An acknowledgement does not

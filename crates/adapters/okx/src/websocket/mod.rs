@@ -24,6 +24,7 @@
 //! - Authentication and automatic reconnection.
 //! - Channel subscription management.
 
+pub mod capture;
 pub mod client;
 pub mod enums;
 pub mod error;
