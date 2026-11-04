@@ -891,7 +891,7 @@ class TestLiveExecutionEngine:
             quantity=AUDUSD_SIM.make_qty(100),
         )
 
-        self.cache.add_order(order)
+        self.cache.add_order(order, client_id=self.client.id)
         # Create an old submitted event so the order appears delayed
         old_ts = (
             self.clock.timestamp_ns()
