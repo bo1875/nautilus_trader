@@ -1772,3 +1772,99 @@ async def test_batch_cancel_orders_only_algo_orders(exec_client_builder, monkeyp
     http_client.cancel_algo_orders.assert_awaited_once()
     http_call_args = http_client.cancel_algo_orders.call_args[0][0]
     assert len(http_call_args) == 2  # Both algo orders
+
+
+@pytest.mark.asyncio
+async def test_reconnect_schedules_full_recovery_without_pending_entries(
+    exec_client_builder,
+    monkeypatch,
+    msgbus,
+):
+    client, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    report = object()
+    recover = AsyncMock(return_value=report)
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    received = []
+    msgbus.register("ExecEngine.reconcile_execution_mass_status", received.append)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client._handle_ws_reconnect(event)
+    await client._ws_recovery_task
+    recover.assert_awaited_once_with()
+    assert received == [report]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_failed_recovery_retains_uncertainty(exec_client_builder, monkeypatch):
+    client, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    recover = AsyncMock(side_effect=RuntimeError("synthetic read failure"))
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    event = SimpleNamespace(pending_count=200, omitted_count=72)
+    client._handle_ws_reconnect(event)
+    await client._ws_recovery_task
+    recover.assert_awaited_once_with()
+    assert client._ws_recovery_required
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_readback_schedules_followup(exec_client_builder, monkeypatch):
+    import asyncio
+
+    client, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def readback():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+        return object()
+
+    monkeypatch.setattr(client, "generate_mass_status", readback)
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", lambda report: None)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client._handle_ws_reconnect(event)
+    await started.wait()
+    task = client._ws_recovery_task
+    client._handle_ws_reconnect(event)
+    assert client._ws_recovery_task is task
+    release.set()
+    await task
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reconnect_actual_mass_read_failure_sends_no_report(exec_client_builder, monkeypatch):
+    client, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    monkeypatch.setattr(
+        client,
+        "generate_order_status_reports",
+        AsyncMock(side_effect=RuntimeError("synthetic failure")),
+    )
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    received = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", received.append)
+    client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
+    await client._ws_recovery_task
+    assert client._ws_recovery_required
+    assert not received
+
+
+@pytest.mark.asyncio
+async def test_reconnect_without_strict_collector_keeps_recovery_required(
+    exec_client_builder, monkeypatch
+):
+    client, *_ = exec_client_builder(monkeypatch)
+    recover = AsyncMock()
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
+    assert client._ws_recovery_required
+    assert client._ws_recovery_task is None
+    recover.assert_not_awaited()

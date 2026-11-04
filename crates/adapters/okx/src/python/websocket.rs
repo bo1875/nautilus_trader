@@ -319,7 +319,12 @@ impl OKXWebSocketClient {
                         NautilusWsMessage::InstrumentStatus(msg) => {
                             call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
                         }
-                        NautilusWsMessage::Reconnected => {} // Nothing to handle
+                        NautilusWsMessage::Reconnected(msg) => {
+                            forward_reconnect(&call_soon, &callback, msg);
+                        }
+                        NautilusWsMessage::RequestObservation(msg) => {
+                            call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
+                        }
                         NautilusWsMessage::Authenticated => {} // Nothing to handle
                         NautilusWsMessage::Error(msg) => {
                             call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
@@ -1243,4 +1248,95 @@ where
         Ok(py_obj) => call_python_threadsafe(py, call_soon, callback, py_obj),
         Err(e) => log::error!("Failed to convert data to Python object: {e}"),
     });
+}
+
+fn forward_reconnect(
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+    event: crate::websocket::messages::OKXWebSocketReconnect,
+) {
+    call_python_with_data(call_soon, callback, |py| event.into_py_any(py));
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::forward_reconnect;
+    use crate::websocket::messages::{OKXRequestObservation, OKXWebSocketReconnect};
+    use pyo3::{prelude::*, types::PyDict};
+    use std::ffi::CString;
+
+    #[test]
+    fn test_compiled_reconnect_bridge_schedules_python_recovery() {
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            globals
+                .set_item(
+                    "source",
+                    include_str!("../../../../../nautilus_trader/adapters/okx/execution.py"),
+                )
+                .unwrap();
+            globals
+                .set_item("Reconnect", py.get_type::<OKXWebSocketReconnect>())
+                .unwrap();
+            globals
+                .set_item("Observation", py.get_type::<OKXRequestObservation>())
+                .unwrap();
+            // Execute the actual consumer methods without requiring unrelated Cython extensions.
+            let setup = CString::new(r#"
+import ast, asyncio
+from typing import Any
+from types import SimpleNamespace
+methods = {"_handle_msg", "_handle_ws_reconnect", "_recover_after_ws_reconnect", "_handle_ws_request_observation"}
+cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "OKXExecutionClient")
+cls.body = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in methods]
+cls.bases = []
+exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), "consumer.py", "exec"))
+nautilus_pyo3 = SimpleNamespace(OKXWebSocketError=type("Error", (), {}), OKXWebSocketReconnect=Reconnect, OKXRequestObservation=Observation)
+loop = asyncio.new_event_loop()
+client = OKXExecutionClient()
+client._ws_recovery_task = None
+client._ws_recovery_required = False
+client._mass_status_reports_complete = True
+client._log = SimpleNamespace(warning=lambda *a: None, exception=lambda *a: None)
+client.create_task = loop.create_task
+received = []
+client._msgbus = SimpleNamespace(send=lambda **kw: received.append(kw["msg"]))
+calls = []
+async def readback():
+    calls.append(1)
+    if len(calls) == 1:
+        raise RuntimeError("synthetic read failure")
+    return "synthetic report"
+client.generate_mass_status = readback
+callback = client._handle_msg
+call_soon = loop.call_soon_threadsafe
+"#).unwrap();
+            py.run(&setup, Some(&globals), None).unwrap();
+            let call_soon = globals.get_item("call_soon").unwrap().unwrap().unbind();
+            let callback = globals.get_item("callback").unwrap().unwrap().unbind();
+            for generation in 1..=2 {
+                forward_reconnect(
+                    &call_soon,
+                    &callback,
+                    OKXWebSocketReconnect {
+                        schema_version: 1,
+                        connection_id: "synthetic-connection".into(),
+                        connection_generation: generation,
+                        ts_observed_ns: generation * 1000,
+                        pending_count: 0,
+                        omitted_count: 0,
+                        observations_dropped: 0,
+                        pending: vec![],
+                    },
+                );
+                let check = CString::new(if generation == 1 {
+                    "loop.run_until_complete(asyncio.sleep(0))\nassert calls == [1]\nassert client._ws_recovery_required\nassert received == []"
+                } else {
+                    "loop.run_until_complete(asyncio.sleep(0))\nassert calls == [1, 1]\nassert not client._ws_recovery_required\nassert received == ['synthetic report']\nloop.close()"
+                }).unwrap();
+                py.run(&check, Some(&globals), None).unwrap();
+            }
+        });
+    }
 }

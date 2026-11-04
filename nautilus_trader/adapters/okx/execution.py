@@ -192,6 +192,8 @@ class OKXExecutionClient(LiveExecutionClient):
             heartbeat=20,
         )
         self._ws_client_futures: set[asyncio.Future] = set()
+        self._ws_recovery_task: asyncio.Task | None = None
+        self._ws_recovery_required = False
 
         self._ws_business_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=nautilus_pyo3.get_okx_ws_url_business(config.is_demo),
@@ -345,6 +347,10 @@ class OKXExecutionClient(LiveExecutionClient):
         await self._ws_client.subscribe_account()
 
     async def _disconnect(self) -> None:
+        if self._ws_recovery_task is not None:
+            self._ws_recovery_task.cancel()
+            await asyncio.gather(self._ws_recovery_task, return_exceptions=True)
+
         # Shutdown websocket
         if not self._ws_client.is_closed():
             self._log.info("Disconnecting websocket")
@@ -1766,7 +1772,11 @@ class OKXExecutionClient(LiveExecutionClient):
             return
 
         try:
-            if isinstance(msg, nautilus_pyo3.AccountState):
+            if isinstance(msg, getattr(nautilus_pyo3, "OKXWebSocketReconnect", ())):
+                self._handle_ws_reconnect(msg)
+            elif isinstance(msg, getattr(nautilus_pyo3, "OKXRequestObservation", ())):
+                self._handle_ws_request_observation(msg)
+            elif isinstance(msg, nautilus_pyo3.AccountState):
                 self._handle_account_state(msg)
             elif isinstance(msg, nautilus_pyo3.OrderAccepted):
                 self._handle_order_accepted_pyo3(msg)
@@ -1792,6 +1802,53 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._log.debug(f"Received unhandled message type: {type(msg)}")
         except Exception as e:
             self._log.exception("Error handling websocket message", e)
+
+    def _handle_ws_request_observation(self, observation: Any) -> None:
+        # Extension hook for transport diagnostics. An acknowledgement does not
+        # confirm order terms and must not release an execution reservation.
+        pass
+
+    def _handle_ws_reconnect(self, event: Any) -> None:
+        """
+        Schedule full readback, including empty or truncated correlation snapshots.
+
+        Integrations may override this hook to notify their existing recovery owner.
+        Do not treat delivery, authentication, or report submission as settlement.
+        """
+        self._log.warning(
+            f"Websocket reconnect requires recovery: pending={event.pending_count}, "
+            f"omitted={event.omitted_count}",
+        )
+        self._ws_recovery_required = True
+        if not getattr(self, "_mass_status_reports_complete", False):
+            self._log.warning(
+                "Reconnect recovery requires a strict mass-report collector or recovery hook override",
+            )
+            return
+        if self._ws_recovery_task is None or self._ws_recovery_task.done():
+            self._ws_recovery_task = self.create_task(self._recover_after_ws_reconnect())
+
+    async def _recover_after_ws_reconnect(self) -> None:
+        # Coalesce bursts without dropping a reconnect arriving during a read.
+        while self._ws_recovery_required:
+            self._ws_recovery_required = False
+            try:
+                report = await self.generate_mass_status()
+                if report is None:
+                    self._ws_recovery_required = True
+                    self._log.warning("Reconnect readback incomplete; recovery remains required")
+                    return
+                self._msgbus.send(
+                    endpoint="ExecEngine.reconcile_execution_mass_status",
+                    msg=report,
+                )
+            except asyncio.CancelledError:
+                self._ws_recovery_required = True
+                raise
+            except Exception as exc:
+                self._ws_recovery_required = True
+                self._log.exception("Reconnect readback failed; recovery remains required", exc)
+                return
 
     def _handle_instrument_update(self, pyo3_instrument: OkxInstrument) -> None:
         self._http_client.cache_instrument(pyo3_instrument)  # type: ignore [arg-type]

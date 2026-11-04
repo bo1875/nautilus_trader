@@ -64,8 +64,49 @@ pub enum NautilusWsMessage {
     ExecutionReports(Vec<ExecutionReport>),
     Error(OKXWebSocketError),
     Raw(serde_json::Value), // Unhandled channels
-    Reconnected,
+    Reconnected(OKXWebSocketReconnect),
+    RequestObservation(OKXRequestObservation),
     Authenticated,
+}
+
+/// A transport observation, never evidence of confirmed order terms or released exposure.
+/// Times are local UNIX nanoseconds. Correlation registration precedes serialization/retries;
+/// send completion is a local transport return, not venue receipt. No caller time is inferred.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(from_py_object, frozen, get_all))]
+pub struct OKXRequestObservation {
+    pub schema_version: u8,
+    pub connection_id: String,
+    pub connection_generation: u64,
+    pub request_id: String,
+    pub operation: String,
+    pub client_order_id: String,
+    pub venue_order_id: Option<String>,
+    pub instrument_id: String,
+    pub requested_price: Option<String>,
+    pub requested_size: Option<String>,
+    pub ts_handler_ns: u64,
+    pub ts_send_completed_ns: Option<u64>,
+    pub ts_observed_ns: u64,
+    pub outcome: String,
+    pub response_code: Option<String>,
+}
+
+/// Reconnect requires recovery even with no outstanding transport correlations.
+/// Only amend/cancel records have detailed observations; other kinds and records
+/// beyond the detail limit are included in pending_count and omitted_count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(from_py_object, frozen, get_all))]
+pub struct OKXWebSocketReconnect {
+    pub schema_version: u8,
+    pub connection_id: String,
+    pub connection_generation: u64,
+    pub ts_observed_ns: u64,
+    pub pending_count: usize,
+    /// Cumulative refused diagnostic delivery attempts, not missing operations.
+    pub observations_dropped: u64,
+    pub omitted_count: usize,
+    pub pending: Vec<OKXRequestObservation>,
 }
 
 /// Represents an OKX WebSocket error.
