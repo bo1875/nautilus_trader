@@ -6,7 +6,7 @@ The `maintenance/1.224.0` branch includes OKX status and endpoint corrections, o
 
 Commit `9c78e575f2a4590b98ec01b5cd314a34bbe45a1d` reproduces the previously qualified source exactly. Its 4,078 input files have combined SHA-256 `58bea7fefcd713e51a1b0436c24aa0cf513b2aff9a1d52b1f4d963456b3b716d`. That qualification does not certify a newly built binary.
 
-The maintained release uses the distinct identity `1.224.0+fork.1`. CI builds a Linux x86-64 CPython 3.12 wheel in a clean Debian Bookworm container, runs Rust OKX tests and installed-native regression tests, and retains the wheel, hashes, toolchain details and test reports as artifacts. It does not publish a release or deploy automatically. Application compatibility and exact artifact acceptance precede release adoption.
+The maintained release uses the distinct identity `1.224.0+fork.2`. CI builds a Linux x86-64 CPython 3.12 wheel in a clean Debian Bookworm container, runs Rust OKX tests and installed-native regression tests, and retains the wheel, hashes, toolchain details and test reports as artifacts. It does not publish a release or deploy automatically. Application compatibility and exact artifact acceptance precede release adoption.
 
 Use immutable commits and wheel SHA-256 pins. Do not depend on the moving maintenance branch. Upstream LICENSE and copyright notices remain in force; this is an independently maintained fork, not an upstream release.
 
