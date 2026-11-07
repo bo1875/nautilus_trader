@@ -32,14 +32,17 @@ from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import QueryOrder
+from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import Venue
@@ -531,6 +534,9 @@ async def test_check_orders_consistency_handles_client_exception(
     order.apply(accepted)
     exec_engine.process(accepted)
 
+    cache.update_order(order)
+    assert order.client_order_id in cache.client_order_ids_open()
+
     # Make client raise exception - patch the method on the registered client
     async def raise_error(command):
         raise RuntimeError("API error")
@@ -543,6 +549,7 @@ async def test_check_orders_consistency_handles_client_exception(
 
     # Assert
     assert order.status == OrderStatus.ACCEPTED
+    assert order.client_order_id not in exec_engine._recon_check_retries
 
 
 @pytest.mark.asyncio
@@ -679,17 +686,18 @@ async def test_check_inflight_orders_skips_when_recent_query_pending(
 @pytest.mark.asyncio
 async def test_check_inflight_orders_respects_retry_limit(
     exec_engine_inflight_check,
+    exec_client,
     cache,
     account_id,
     clock,
 ):
     """
-    Test _check_inflight_orders stops querying after max retries.
+    Test _check_inflight_orders requires a final negative query after max retries.
     """
     # Arrange
     exec_engine = exec_engine_inflight_check
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Submit order (makes it inflight)
     submitted_event = TestEventStubs.order_submitted(
@@ -1541,7 +1549,7 @@ async def test_accepted_order_not_found_at_venue_reconciles_to_rejected(
     """
     # Arrange
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to be checked
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -1586,7 +1594,7 @@ async def test_partially_filled_order_not_found_at_venue_reconciles_to_canceled(
         instrument=AUDUSD_SIM,
         quantity=Quantity.from_int(100),
     )
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to be checked
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -1698,7 +1706,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     )
 
     # Order1: ACCEPTED and exists at venue
-    cache.add_order(order1)
+    cache.add_order(order1, client_id=exec_client.id)
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
     submitted1 = TestEventStubs.order_submitted(order1, account_id=account_id, ts_event=old_ts)
     accepted1 = TestEventStubs.order_accepted(order1, account_id=account_id, ts_event=old_ts)
@@ -1709,7 +1717,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     cache.update_order(order1)
 
     # Order2: ACCEPTED but NOT at venue
-    cache.add_order(order2)
+    cache.add_order(order2, client_id=exec_client.id)
     submitted2 = TestEventStubs.order_submitted(order2, account_id=account_id, ts_event=old_ts)
     accepted2 = TestEventStubs.order_accepted(order2, account_id=account_id, ts_event=old_ts)
     order2.apply(submitted2)
@@ -1719,7 +1727,7 @@ async def test_mixed_orders_with_some_not_found_at_venue(
     cache.update_order(order2)
 
     # Order3: FILLED (not at venue is normal)
-    cache.add_order(order3)
+    cache.add_order(order3, client_id=exec_client.id)
     submitted3 = TestEventStubs.order_submitted(order3, account_id=account_id, ts_event=old_ts)
     accepted3 = TestEventStubs.order_accepted(order3, account_id=account_id, ts_event=old_ts)
     filled3 = TestEventStubs.order_filled(order3, instrument=AUDUSD_SIM, ts_event=old_ts)
@@ -1782,7 +1790,7 @@ async def test_missing_order_respects_retry_threshold(
     exec_engine.open_check_missing_retries = 2  # Set threshold to 2
 
     order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to check (older than threshold)
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -2086,7 +2094,7 @@ async def test_open_check_full_history_mode_does_reject_missing_orders(
         instrument=AUDUSD_SIM,
         client_order_id=ClientOrderId("O-456"),
     )
-    cache.add_order(order)
+    cache.add_order(order, client_id=exec_client.id)
 
     # Make order old enough to check
     old_ts = clock.timestamp_ns() - 10_000_000_000  # 10 seconds ago
@@ -2503,12 +2511,9 @@ async def test_query_order_status_reports_handles_exceptions(exec_engine_open_ch
 
     exec_client.generate_order_status_reports = raise_error
 
-    # Act
-    all_reports, venue_reported_ids = await exec_engine_open_check._query_order_status_reports()
-
-    # Assert
-    assert len(all_reports) == 0
-    assert len(venue_reported_ids) == 0
+    with pytest.raises(IncompleteOrderStatusReports) as exc:
+        await exec_engine_open_check._query_order_status_reports()
+    assert exc.value.reports == []
 
 
 @pytest.mark.asyncio
@@ -3230,3 +3235,561 @@ async def test_reconcile_order_reports_proceeds_after_threshold_exceeded(
 
     # Assert - reconciliation should proceed since activity is past threshold
     assert reconciled_count == 1, "Reconciliation should proceed when threshold exceeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_fill", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["transport", "application", "missing_client", "unregistered_client"]
+)
+async def test_periodic_targeted_failure_preserves_order(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    partial_fill,
+    failure,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    client_id = None if failure == "missing_client" else exec_client.id
+    if failure == "unregistered_client":
+        client_id = ClientId("UNREGISTERED")
+    cache.add_order(order, client_id=client_id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+    if partial_fill:
+        order.apply(
+            TestEventStubs.order_filled(
+                order,
+                instrument=AUDUSD_SIM,
+                last_qty=Quantity.from_int(50),
+            )
+        )
+    cache.update_order(order)
+    before = list(order.events)
+    status = order.status
+    filled_qty = order.filled_qty
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+
+    async def targeted(command):
+        if failure == "transport":
+            raise TimeoutError("Synthetic read timeout")
+        return OrderStatusReport(
+            account_id=account_id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            order_side=order.side,
+            order_type=order.order_type,
+            time_in_force=order.time_in_force,
+            order_status=OrderStatus.FILLED,
+            price=order.price,
+            quantity=order.quantity,
+            filled_qty=order.quantity,
+            report_id=UUID4(),
+            ts_accepted=0,
+            ts_last=0,
+            ts_init=0,
+        )
+
+    def fail_application(report, trades):
+        raise TypeError("Synthetic local reconciliation failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", targeted)
+    if failure == "application":
+        monkeypatch.setattr(engine, "_reconcile_order_report", fail_application)
+
+    await engine._check_orders_consistency()
+
+    assert order.status == status
+    assert order.filled_qty == filled_qty
+    assert order.events == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["submitted", "pending_update", "pending_cancel"])
+async def test_inflight_read_failure_cannot_resolve_timeout(
+    exec_engine_inflight_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    state,
+):
+    engine = exec_engine_inflight_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    if state != "submitted":
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+        event = getattr(TestEventStubs, f"order_{state}")(order, ts_event=0)
+        order.apply(event)
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = engine.inflight_check_max_retries
+
+    async def failed_read(command):
+        raise TimeoutError("Synthetic read timeout")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", failed_read)
+    await engine._check_inflight_orders()
+
+    assert order.events == before
+    assert order.is_inflight
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ["absent", "new_fill", "new_activity", "positive", "apply_error", "apply_unresolved", "cancel"],
+)
+async def test_inflight_threshold_requires_current_absence(
+    exec_engine_inflight_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    outcome,
+):
+    engine = exec_engine_inflight_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    engine._recon_check_retries[order.client_order_id] = engine.inflight_check_max_retries
+
+    async def read(command):
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        if outcome == "new_fill":
+            order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+            order.apply(
+                TestEventStubs.order_filled(
+                    order, instrument=AUDUSD_SIM, last_qty=Quantity.from_int(50)
+                )
+            )
+            cache.update_order(order)
+        if outcome == "new_activity":
+            engine._order_local_activity_ns[order.client_order_id] = engine._clock.timestamp_ns()
+        if outcome in ("positive", "apply_error", "apply_unresolved"):
+            return OrderStatusReport(
+                account_id=account_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=VenueOrderId("1"),
+                order_side=order.side,
+                order_type=order.order_type,
+                time_in_force=order.time_in_force,
+                order_status=OrderStatus.ACCEPTED,
+                price=order.price,
+                quantity=order.quantity,
+                filled_qty=Quantity.from_int(0),
+                report_id=UUID4(),
+                ts_accepted=0,
+                ts_last=0,
+                ts_init=0,
+            )
+        return None
+
+    def apply(report, trades):
+        if outcome == "apply_error":
+            raise TypeError("Synthetic reconciliation failure")
+        return False
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", read)
+    if outcome in ("apply_error", "apply_unresolved"):
+        monkeypatch.setattr(engine, "_reconcile_order_report", apply)
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await engine._check_inflight_orders()
+    else:
+        await engine._check_inflight_orders()
+
+    expected_status = {
+        "absent": OrderStatus.REJECTED,
+        "new_fill": OrderStatus.PARTIALLY_FILLED,
+        "positive": OrderStatus.ACCEPTED,
+    }.get(outcome, OrderStatus.SUBMITTED)
+    assert order.status == expected_status
+    assert order.filled_qty == Quantity.from_int(50 if outcome == "new_fill" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("entrypoint", ["single", "bulk", "mass", "targeted"])
+@pytest.mark.parametrize("application", ["noop", "error"])
+@pytest.mark.parametrize("identity", ["client", "venue"])
+async def test_positive_report_receipt_invalidates_pending_absence(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    caller,
+    entrypoint,
+    application,
+    identity,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    if caller == "periodic":
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    else:
+        cache.add_venue_order_id(order.client_order_id, VenueOrderId("1"))
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def old_negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    def apply(report, trades):
+        if application == "error":
+            raise TypeError("Synthetic local application failure")
+        return True
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", old_negative)
+    monkeypatch.setattr(engine, "_reconcile_order_report", apply)
+    pending = asyncio.create_task(
+        engine._check_orders_consistency()
+        if caller == "periodic"
+        else engine._check_inflight_orders(),
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    report = OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id if identity == "client" else None,
+        venue_order_id=VenueOrderId("1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.CANCELED if application == "error" else OrderStatus.ACCEPTED,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        report_id=UUID4(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+    try:
+        if entrypoint == "targeted":
+
+            async def targeted(command):
+                return report
+
+            monkeypatch.setattr(exec_client, "generate_order_status_report", targeted)
+            engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+            await engine._check_orders_consistency()
+        elif entrypoint == "bulk":
+
+            async def bulk(command):
+                return [report]
+
+            monkeypatch.setattr(exec_client, "generate_order_status_reports", bulk)
+            await engine._check_orders_consistency()
+        else:
+            context = (
+                pytest.raises(TypeError) if application == "error" else contextlib.nullcontext()
+            )
+            with context:
+                if entrypoint == "single":
+                    engine.reconcile_execution_report(report)
+                else:
+                    mass = ExecutionMassStatus(
+                        client_id=exec_client.id,
+                        account_id=account_id,
+                        venue=SIM,
+                        report_id=UUID4(),
+                        ts_init=0,
+                    )
+                    mass.add_order_reports([report])
+                    engine.reconcile_execution_mass_status(mass)
+        assert order.events == before
+    finally:
+        release.set()
+        await pending
+    assert order.events == before
+    assert not order.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", [False, True])
+async def test_bulk_receipt_fences_absence_before_other_client_finishes(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    incomplete,
+):
+    engine = exec_engine_open_check
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=exec_client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    before = list(order.events)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    entered, release, slow_entered, slow_release = (asyncio.Event() for _ in range(4))
+
+    async def old_negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", old_negative)
+    pending = asyncio.create_task(engine._check_orders_consistency())
+    await asyncio.wait_for(entered.wait(), 1)
+    report = _absence_test_report(order, account_id)
+
+    async def positive(command):
+        if incomplete:
+            raise IncompleteOrderStatusReports([report])
+        return [report]
+
+    async def slow(command):
+        slow_entered.set()
+        await slow_release.wait()
+        return []
+
+    other_client = MockLiveExecutionClient(
+        loop=asyncio.get_running_loop(),
+        client_id=ClientId("OTHER"),
+        venue=Venue("OTHER"),
+        account_type=AccountType.CASH,
+        base_currency=USD,
+        instrument_provider=InstrumentProvider(),
+        msgbus=engine._msgbus,
+        cache=cache,
+        clock=engine._clock,
+    )
+    engine.register_client(other_client)
+    monkeypatch.setattr(exec_client, "generate_order_status_reports", positive)
+    monkeypatch.setattr(other_client, "generate_order_status_reports", slow)
+    collection = asyncio.create_task(engine._check_orders_consistency())
+    try:
+        await asyncio.wait_for(slow_entered.wait(), 1)
+        release.set()
+        await pending
+        assert order.events == before
+    finally:
+        release.set()
+        slow_release.set()
+        await pending
+        await collection
+
+
+def _absence_test_report(order, account_id):
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.from_int(0),
+        report_id=UUID4(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_receipt_invalidates_all_older_queries_but_not_a_new_query(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    before = list(order.events)
+    entered = [asyncio.Event() for _ in range(3)]
+    release = [asyncio.Event() for _ in range(3)]
+    calls = 0
+
+    async def negative(command):
+        nonlocal calls
+        index = calls
+        calls += 1
+        entered[index].set()
+        await release[index].wait()
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    tasks = []
+    try:
+        for index in range(3):
+            if index == 2:
+                assert engine.reconcile_execution_report(_absence_test_report(order, account_id))
+            engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+            tasks.append(asyncio.create_task(engine._check_orders_consistency()))
+            await asyncio.wait_for(entered[index].wait(), 1)
+        release[0].set()
+        release[1].set()
+        await asyncio.gather(*tasks[:2])
+        assert order.events == before
+        release[2].set()
+        await tasks[2]
+        assert order.status == OrderStatus.REJECTED
+        assert not engine._pending_absence_queries
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("different", ["order", "account", "instrument", "no_report"])
+async def test_unrelated_receipt_does_not_invalidate_qualified_absence(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    different,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    report = _absence_test_report(order, account_id)
+    if different == "order":
+        report.client_order_id = ClientOrderId("OTHER")
+        report.venue_order_id = VenueOrderId("OTHER")
+    elif different == "account":
+        report.account_id = AccountId("OTHER-001")
+    elif different == "instrument":
+        report.instrument_id = GBPUSD_SIM.id
+    monkeypatch.setattr(engine, "_reconcile_order_report", lambda report, trades: True)
+
+    async def negative(command):
+        if different != "no_report":
+            engine.reconcile_execution_report(report)
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    await engine._check_orders_consistency()
+    assert order.status == OrderStatus.REJECTED
+    assert not engine._pending_absence_queries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["bulk", "mass"])
+async def test_all_collection_receipts_are_fenced_before_first_application_failure(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    entrypoint,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+    before = list(order.events)
+    target = _absence_test_report(order, account_id)
+    first = _absence_test_report(order, account_id)
+    first.client_order_id = ClientOrderId("OTHER")
+    first.venue_order_id = VenueOrderId("OTHER")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def negative(command):
+        entered.set()
+        await release.wait()
+        return None
+
+    def fail(report, trades):
+        assert report.client_order_id == first.client_order_id
+        raise TypeError("Synthetic first-row failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    monkeypatch.setattr(engine, "_reconcile_order_report", fail)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    pending = asyncio.create_task(engine._check_orders_consistency())
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        if entrypoint == "bulk":
+
+            async def bulk(command):
+                return [first, target]
+
+            monkeypatch.setattr(exec_client, "generate_order_status_reports", bulk)
+            await engine._check_orders_consistency()
+        else:
+            mass = ExecutionMassStatus(
+                client_id=exec_client.id,
+                account_id=account_id,
+                venue=SIM,
+                report_id=UUID4(),
+                ts_init=0,
+            )
+            mass.add_order_reports([first, target])
+            with pytest.raises(TypeError):
+                engine.reconcile_execution_mass_status(mass)
+    finally:
+        release.set()
+        await pending
+    assert order.events == before
+
+
+def _open_absence_test_order(cache, client, account_id):
+    order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+    cache.add_order(order, client_id=client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id, ts_event=0))
+    order.apply(TestEventStubs.order_accepted(order, account_id=account_id, ts_event=0))
+    cache.update_order(order)
+    return order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_absence_receipt_fence_is_released_after_failed_query(
+    exec_engine_open_check,
+    exec_client,
+    cache,
+    account_id,
+    monkeypatch,
+    cancel,
+):
+    engine = exec_engine_open_check
+    order = _open_absence_test_order(cache, exec_client, account_id)
+
+    async def failed(command):
+        if cancel:
+            raise asyncio.CancelledError
+        raise TimeoutError("Synthetic read failure")
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", failed)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    context = pytest.raises(asyncio.CancelledError) if cancel else contextlib.nullcontext()
+    with context:
+        await engine._check_orders_consistency()
+    assert order.status == OrderStatus.ACCEPTED
+    assert not engine._pending_absence_queries
+
+    async def negative(command):
+        return None
+
+    monkeypatch.setattr(exec_client, "generate_order_status_report", negative)
+    engine._recon_check_retries[order.client_order_id] = engine.open_check_missing_retries
+    await engine._check_orders_consistency()
+    assert order.status == OrderStatus.REJECTED
+    assert not engine._pending_absence_queries

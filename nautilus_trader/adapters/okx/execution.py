@@ -49,6 +49,7 @@ from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.execution_client import LiveExecutionClient
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
@@ -103,6 +104,9 @@ class OKXExecutionClient(LiveExecutionClient):
         The custom client ID.
 
     """
+
+    # Static reader contract, not the outcome of the most recent collection.
+    _mass_status_reports_complete = True
 
     def __init__(
         self,
@@ -456,121 +460,107 @@ class OKXExecutionClient(LiveExecutionClient):
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
-        # Wait for instruments to be cached
-        if not self._http_client.is_initialized():
-            await self._cache_instruments()
+        """
+        Return complete order reports, or raise with any valid positive observations.
 
-        self._log.debug(
-            f"Requesting OrderStatusReports "
-            f"{repr(command.instrument_id) if command.instrument_id else ''}"
-            "...",
-        )
-
-        pyo3_reports: list[nautilus_pyo3.OrderStatusReport] = []
+        IncompleteOrderStatusReports.reports must never be used to infer absence.
+        Cancellation propagates to the caller.
+        """
         reports: list[OrderStatusReport] = []
-
+        error_count = 0
+        phase = "instruments"
         try:
-            if command.instrument_id:
-                # Request for specific instrument
-                pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
-                    command.instrument_id.value,
-                )
-                response = await self._http_client.request_order_status_reports(
+            if not self._http_client.is_initialized():
+                await self._cache_instruments()
+
+            pyo3_instrument_id = (
+                nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+                if command.instrument_id
+                else None
+            )
+            instrument_types = (None,) if command.instrument_id else self._config.instrument_types
+            for instrument_type in instrument_types:
+                phase = "query"
+                response, errors = await self._http_client.request_order_status_reports_with_errors(
                     account_id=self.pyo3_account_id,
                     instrument_id=pyo3_instrument_id,
+                    instrument_type=instrument_type,
                     start=ensure_pydatetime_utc(command.start),
                     end=ensure_pydatetime_utc(command.end),
                     open_only=command.open_only,
                 )
-                pyo3_reports.extend(response)
-            else:
-                for instrument_type in self._config.instrument_types:
-                    response = await self._http_client.request_order_status_reports(
-                        account_id=self.pyo3_account_id,
-                        instrument_type=instrument_type,
-                        start=ensure_pydatetime_utc(command.start),
-                        end=ensure_pydatetime_utc(command.end),
-                        open_only=command.open_only,
-                    )
-                    pyo3_reports.extend(response)
+                error_count += len(errors)
+                phase = "conversion"
+                for pyo3_report in response:
+                    try:
+                        report = OrderStatusReport.from_pyo3(pyo3_report)
+                        self._apply_client_order_alias(report)
+                        reports.append(report)
+                    except Exception:
+                        error_count += 1
+        except Exception as e:
+            self._log.warning(
+                f"Order status query incomplete: command_id={command.id}, "
+                f"phase={phase}, error={type(e).__name__}, reports={len(reports)}",
+            )
+            raise IncompleteOrderStatusReports(reports) from e
 
-            for pyo3_report in pyo3_reports:
-                report = OrderStatusReport.from_pyo3(pyo3_report)
-                self._apply_client_order_alias(report)
-                self._log.debug(f"Received {report}", LogColor.MAGENTA)
-                reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
-            self._log_report_error(e, "OrderStatusReports")
+        if error_count:
+            self._log.warning(
+                f"Order status query incomplete: command_id={command.id}, "
+                f"phase=conversion, errors={error_count}, reports={len(reports)}",
+            )
+            raise IncompleteOrderStatusReports(reports)
 
-        self._log_report_receipt(
-            len(reports),
-            "OrderStatusReport",
-            command.log_receipt_level,
-        )
-
+        self._log_report_receipt(len(reports), "OrderStatusReport", command.log_receipt_level)
         return reports
 
     async def generate_order_status_report(
         self,
         command: GenerateOrderStatusReport,
     ) -> OrderStatusReport | None:
-        if not self._http_client.is_initialized():
-            await self._cache_instruments()
+        """
+        Return a matching observation, or None only after a complete query.
 
-        self._log.debug(
-            "Requesting OrderStatusReport "
-            + ", ".join(
-                repr(x)
-                for x in [
-                    command.instrument_id,
-                    command.client_order_id,
-                    command.venue_order_id,
-                ]
-                if x
-            )
-            + " ...",
-        )
-
-        pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
-
-        canonical_requested_id: ClientOrderId | None = None
-
+        Unrelated row failures do not invalidate a positive match. Without a match,
+        incomplete reads raise IncompleteOrderStatusReports instead of implying absence.
+        """
+        incomplete: IncompleteOrderStatusReports | None = None
         try:
-            pyo3_reports: list[
-                nautilus_pyo3.OrderStatusReport
-            ] = await self._http_client.request_order_status_reports(
-                account_id=self.pyo3_account_id,
-                instrument_id=pyo3_instrument_id,
+            reports = await self.generate_order_status_reports(
+                GenerateOrderStatusReports(
+                    instrument_id=command.instrument_id,
+                    start=None,
+                    end=None,
+                    open_only=False,
+                    command_id=command.id,
+                    ts_init=command.ts_init,
+                    log_receipt_level=LogLevel.DEBUG,
+                ),
             )
+        except IncompleteOrderStatusReports as e:
+            reports = e.reports
+            incomplete = e
 
-            if not pyo3_reports:
-                return None
+        canonical_requested_id = self._canonical_client_order_id(command.client_order_id)
+        for report in reports:
+            canonical_report_id = self._canonical_client_order_id(report.client_order_id)
+            if (
+                canonical_requested_id
+                and canonical_report_id is not None
+                and canonical_report_id == canonical_requested_id
+            ) or (command.venue_order_id and report.venue_order_id == command.venue_order_id):
+                return report
 
-            # Filter for the specific order we're looking for
-            canonical_requested_id = self._canonical_client_order_id(command.client_order_id)
-            self._log.warning(
-                f"Resolving order status lookup for requested {command.client_order_id!r} -> canonical {canonical_requested_id!r}",
-            )
+        if incomplete is not None:
+            raise incomplete
 
-            for pyo3_report in pyo3_reports:
-                report = OrderStatusReport.from_pyo3(pyo3_report)
-                self._apply_client_order_alias(report)
-                canonical_report_id = self._canonical_client_order_id(report.client_order_id)
-                if (
-                    canonical_requested_id
-                    and canonical_report_id is not None
-                    and canonical_report_id == canonical_requested_id
-                ) or (command.venue_order_id and report.venue_order_id == command.venue_order_id):
-                    self._log.debug(f"Received {report}", LogColor.MAGENTA)
-                    return report
-        except (asyncio.CancelledError, Exception) as e:
-            self._log_report_error(e, "OrderStatusReport")
-
+        # Regular-order coverage does not include untriggered algo orders.
         if canonical_requested_id is not None:
             return await self._resolve_algo_fallback(
                 canonical_requested_id,
                 command,
-                pyo3_instrument_id,
+                nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value),
             )
 
         return None
@@ -590,25 +580,33 @@ class OKXExecutionClient(LiveExecutionClient):
             if candidate is not None and candidate not in fallback_ids:
                 fallback_ids.append(candidate)
 
-        algo_ids: set[str] = set()
-        for candidate in fallback_ids:
-            candidate_report = await self._fetch_algo_order_status_report(
-                candidate,
-                pyo3_instrument_id,
-            )
+        algo_ids = {
+            self._algo_order_ids[candidate]
+            for candidate in fallback_ids
+            if candidate in self._algo_order_ids
+        }
+        queries: list[tuple[ClientOrderId | None, str | None]] = [
+            (candidate, None) for candidate in fallback_ids
+        ]
+        queries.extend((None, algo_id) for algo_id in sorted(algo_ids))
+        incomplete_reports: list[OrderStatusReport] = []
+        incomplete = False
+        for candidate, algo_id in queries:
+            try:
+                candidate_report = await self._fetch_algo_order_status_report(
+                    candidate,
+                    pyo3_instrument_id,
+                    algo_id=algo_id,
+                )
+            except IncompleteOrderStatusReports as e:
+                incomplete = True
+                incomplete_reports.extend(e.reports)
+                continue
             if candidate_report is not None:
                 return candidate_report
-            algo_id = self._algo_order_ids.get(candidate)
-            if algo_id is not None:
-                algo_ids.add(algo_id)
 
-        for algo_id in algo_ids:
-            candidate_report = await self._fetch_algo_order_status_report_by_algo_id(
-                algo_id,
-                pyo3_instrument_id,
-            )
-            if candidate_report is not None:
-                return candidate_report
+        if incomplete:
+            raise IncompleteOrderStatusReports(incomplete_reports)
 
         exchange_client_order_id = self._exchange_client_order_id(command.client_order_id)
         algo_ids_repr = sorted(algo_ids) if algo_ids else None
@@ -622,67 +620,45 @@ class OKXExecutionClient(LiveExecutionClient):
 
     async def _fetch_algo_order_status_report(
         self,
-        query_client_order_id: ClientOrderId,
+        query_client_order_id: ClientOrderId | None,
         pyo3_instrument_id: nautilus_pyo3.InstrumentId,
+        *,
+        algo_id: str | None = None,
     ) -> OrderStatusReport | None:
-        try:
-            pyo3_client_order_id = nautilus_pyo3.ClientOrderId(
-                query_client_order_id.value,
-            )
-            algo_report = await self._http_client.request_algo_order_status_report(
-                account_id=self.pyo3_account_id,
-                instrument_id=pyo3_instrument_id,
-                client_order_id=pyo3_client_order_id,
-            )
-            if algo_report is None:
-                return None
-
-            report = OrderStatusReport.from_pyo3(algo_report)
-            self._apply_client_order_alias(report)
-            self._log.debug(
-                f"Resolved OKX algo order status via fallback for {query_client_order_id!r}",
-            )
-            return report
-        except ValueError as e:
-            if "404" in str(e) or "Not Found" in str(e):
-                self._log.debug(
-                    f"OKX algo order status not found for {query_client_order_id!r} (404)",
-                )
-            else:
-                self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
-        except Exception as e:
-            self._log.exception("Failed to generate OKX algo OrderStatusReport", e)
-
-        return None
-
-    async def _fetch_algo_order_status_report_by_algo_id(
-        self,
-        algo_id: str,
-        pyo3_instrument_id: nautilus_pyo3.InstrumentId,
-    ) -> OrderStatusReport | None:
-        try:
-            algo_reports = await self._http_client.request_algo_order_status_reports(
-                account_id=self.pyo3_account_id,
-                instrument_id=pyo3_instrument_id,
-                algo_id=algo_id,
-            )
-            for algo_report in algo_reports:
+        reports: list[OrderStatusReport] = []
+        # Missing strict methods on an older binary raise; never substitute an empty read.
+        (
+            algo_reports,
+            errors,
+        ) = await self._http_client.request_algo_order_status_reports_with_errors(
+            account_id=self.pyo3_account_id,
+            instrument_id=pyo3_instrument_id,
+            algo_id=algo_id,
+            algo_client_order_id=(
+                nautilus_pyo3.ClientOrderId(query_client_order_id.value)
+                if query_client_order_id is not None
+                else None
+            ),
+        )
+        incomplete = bool(errors)
+        for algo_report in algo_reports:
+            try:
                 report = OrderStatusReport.from_pyo3(algo_report)
                 self._apply_client_order_alias(report)
-                self._log.debug(
-                    f"Resolved OKX algo order status via algo_id={algo_id}",
-                )
-                return report
-        except ValueError as e:
-            if "404" in str(e) or "Not Found" in str(e):
-                self._log.debug(
-                    f"OKX algo order status not found for algo_id={algo_id} (404)",
-                )
-            else:
-                self._log.exception("Failed to query OKX algo order by algo_id", e)
-        except Exception as e:
-            self._log.exception("Failed to query OKX algo order by algo_id", e)
+                reports.append(report)
+            except Exception:
+                incomplete = True
 
+        for report in reports:
+            if (
+                query_client_order_id is not None
+                and self._canonical_client_order_id(report.client_order_id)
+                == self._canonical_client_order_id(query_client_order_id)
+            ) or (algo_id is not None and report.venue_order_id.value == algo_id):
+                return report
+
+        if incomplete:
+            raise IncompleteOrderStatusReports(reports)
         return None
 
     async def generate_fill_reports(
@@ -714,21 +690,25 @@ class OKXExecutionClient(LiveExecutionClient):
                 pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
                     command.instrument_id.value,
                 )
-                response = await self._http_client.request_fill_reports(
+                response, errors = await self._http_client.request_fill_reports_with_errors(
                     account_id=self.pyo3_account_id,
                     instrument_id=pyo3_instrument_id,
                     start=ensure_pydatetime_utc(command.start),
                     end=ensure_pydatetime_utc(command.end),
                 )
+                if errors:
+                    raise RuntimeError("Incomplete fill reports")
                 pyo3_reports.extend(response)
             else:
                 for instrument_type in self._config.instrument_types:
-                    response = await self._http_client.request_fill_reports(
+                    response, errors = await self._http_client.request_fill_reports_with_errors(
                         account_id=self.pyo3_account_id,
                         instrument_type=instrument_type,
                         start=ensure_pydatetime_utc(command.start),
                         end=ensure_pydatetime_utc(command.end),
                     )
+                    if errors:
+                        raise RuntimeError("Incomplete fill reports")
                     pyo3_reports.extend(response)
 
             for pyo3_report in pyo3_reports:
@@ -737,8 +717,9 @@ class OKXExecutionClient(LiveExecutionClient):
                 if canonical_id is not None:
                     report.client_order_id = canonical_id
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "FillReports")
+            raise
 
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
@@ -765,6 +746,8 @@ class OKXExecutionClient(LiveExecutionClient):
                 cash_bal = Decimal(detail.cash_bal or "0")
                 liab = Decimal(detail.liab or "0")
                 net_balance = cash_bal - liab
+                if not net_balance.is_finite():
+                    raise ValueError("Non-finite wallet balance")
 
                 wallet_by_currency[currency_code] = (
                     wallet_by_currency.get(currency_code, Decimal(0)) + net_balance
@@ -807,6 +790,7 @@ class OKXExecutionClient(LiveExecutionClient):
                     reports.append(report)
         except Exception as e:
             self._log.exception("Failed to generate SPOT position report(s) from wallet", e)
+            raise
 
         for report in reports:
             self._log.debug(f"Generated SPOT position report from wallet: {report}")
@@ -821,10 +805,12 @@ class OKXExecutionClient(LiveExecutionClient):
         position_side = PositionSide.LONG if wallet_balance > 0 else PositionSide.SHORT
         abs_balance = abs(wallet_balance)
 
-        try:
-            quantity = instrument.make_qty(str(abs_balance), round_down=True)
-        except ValueError:
+        if not abs_balance.is_finite():
+            raise ValueError("Non-finite wallet balance")
+        if abs_balance < instrument.size_increment.as_decimal():
             quantity = Quantity.zero(instrument.size_precision)
+        else:
+            quantity = instrument.make_qty(str(abs_balance), round_down=True)
 
         if quantity == 0:
             return PositionStatusReport.create_flat(
@@ -845,6 +831,20 @@ class OKXExecutionClient(LiveExecutionClient):
             ts_last=self._clock.timestamp_ns(),
             ts_init=self._clock.timestamp_ns(),
         )
+
+    async def _request_position_status_reports(
+        self,
+        instrument_type: OKXInstrumentType | None = None,
+        instrument_id: nautilus_pyo3.InstrumentId | None = None,
+    ) -> list[nautilus_pyo3.PositionStatusReport]:
+        reports, errors = await self._http_client.request_position_status_reports_with_errors(
+            account_id=self.pyo3_account_id,
+            instrument_type=instrument_type,
+            instrument_id=instrument_id,
+        )
+        if errors:
+            raise RuntimeError("Incomplete position reports")
+        return reports
 
     async def generate_position_status_reports(  # noqa: C901 (too complex)
         self,
@@ -878,8 +878,7 @@ class OKXExecutionClient(LiveExecutionClient):
                         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
                             command.instrument_id.value,
                         )
-                        response = await self._http_client.request_position_status_reports(
-                            account_id=self.pyo3_account_id,
+                        response = await self._request_position_status_reports(
                             instrument_id=pyo3_instrument_id,
                             instrument_type=OKXInstrumentType.MARGIN,
                         )
@@ -913,8 +912,7 @@ class OKXExecutionClient(LiveExecutionClient):
                     pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
                         command.instrument_id.value,
                     )
-                    response = await self._http_client.request_position_status_reports(
-                        account_id=self.pyo3_account_id,
+                    response = await self._request_position_status_reports(
                         instrument_id=pyo3_instrument_id,
                     )
 
@@ -939,8 +937,7 @@ class OKXExecutionClient(LiveExecutionClient):
                         # SPOT instruments: check margin mode first
                         if self._config.use_spot_margin:
                             # SPOT MARGIN: Use positions API like SWAP/FUTURES (always)
-                            response = await self._http_client.request_position_status_reports(
-                                account_id=self.pyo3_account_id,
+                            response = await self._request_position_status_reports(
                                 instrument_type=OKXInstrumentType.MARGIN,
                             )
                             pyo3_reports.extend(response)
@@ -951,8 +948,7 @@ class OKXExecutionClient(LiveExecutionClient):
                         # If neither, skip SPOT entirely (no position reports)
                         continue
 
-                    response = await self._http_client.request_position_status_reports(
-                        account_id=self.pyo3_account_id,
+                    response = await self._request_position_status_reports(
                         instrument_type=instrument_type,
                     )
                     pyo3_reports.extend(response)
@@ -961,8 +957,9 @@ class OKXExecutionClient(LiveExecutionClient):
                 report = PositionStatusReport.from_pyo3(pyo3_report)
                 self._log.debug(f"Received {report}", LogColor.MAGENTA)
                 reports.append(report)
-        except (asyncio.CancelledError, Exception) as e:
+        except Exception as e:
             self._log_report_error(e, "PositionReports")
+            raise
 
         self._log_report_receipt(
             len(reports),

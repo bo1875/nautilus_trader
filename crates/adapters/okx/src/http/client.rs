@@ -3779,7 +3779,7 @@ impl OKXHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails.
+    /// Returns an error if a request or row conversion is incomplete.
     #[allow(clippy::too_many_arguments)]
     pub async fn request_algo_order_status_reports(
         &self,
@@ -3791,6 +3791,39 @@ impl OKXHttpClient {
         state: Option<OKXOrderStatus>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let (reports, errors) = self
+            .request_algo_order_status_reports_with_errors(
+                account_id,
+                instrument_type,
+                instrument_id,
+                algo_id,
+                algo_client_order_id,
+                state,
+                limit,
+            )
+            .await?;
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Incomplete algo order reports: {}",
+            errors.join("; ")
+        );
+        Ok(reports)
+    }
+
+    /// Retains usable algo observations alongside incomplete endpoint or row diagnostics.
+    /// Only an empty error list permits a negative lookup result. The legacy readers
+    /// use this same collector and raise on incompleteness instead of discarding it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_algo_order_status_reports_with_errors(
+        &self,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        algo_id: Option<String>,
+        algo_client_order_id: Option<ClientOrderId>,
+        state: Option<OKXOrderStatus>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, Vec<String>)> {
         let mut instruments_cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
 
         let inst_type = if let Some(inst_type) = instrument_type {
@@ -3835,45 +3868,34 @@ impl OKXHttpClient {
         let mut reports = Vec::new();
         let mut seen: AHashSet<(String, String)> = AHashSet::new();
 
-        let pending = match self.inner.get_order_algo_pending(params.clone()).await {
-            Ok(result) => result,
-            Err(OKXHttpError::UnexpectedStatus { status, .. })
-                if status == StatusCode::NOT_FOUND =>
-            {
-                Vec::new()
+        let mut errors = Vec::new();
+        let pending = self.inner.get_order_algo_pending(params.clone()).await;
+        let history = self.inner.get_order_algo_history(params.clone()).await;
+        for (phase, result) in [("pending", pending), ("history", history)] {
+            match result {
+                Ok(orders) => {
+                    // These endpoints return a bounded page. A saturated page is not
+                    // evidence that an unmatched order is absent.
+                    if orders.len() >= params.limit.unwrap_or(100) as usize {
+                        errors.push(format!("algo:{phase}:page limit reached"));
+                    }
+                    self.collect_algo_reports(
+                        account_id,
+                        &orders,
+                        &params,
+                        &mut instruments_cache,
+                        ts_init,
+                        &mut seen,
+                        &mut reports,
+                        &mut errors,
+                    )
+                    .await?;
+                }
+                Err(_) => errors.push(format!("algo:{phase}:request failed")),
             }
-            Err(e) => return Err(e.into()),
-        };
-        self.collect_algo_reports(
-            account_id,
-            &pending,
-            &mut instruments_cache,
-            ts_init,
-            &mut seen,
-            &mut reports,
-        )
-        .await?;
+        }
 
-        let history = match self.inner.get_order_algo_history(params).await {
-            Ok(result) => result,
-            Err(OKXHttpError::UnexpectedStatus { status, .. })
-                if status == StatusCode::NOT_FOUND =>
-            {
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
-        self.collect_algo_reports(
-            account_id,
-            &history,
-            &mut instruments_cache,
-            ts_init,
-            &mut seen,
-            &mut reports,
-        )
-        .await?;
-
-        Ok(reports)
+        Ok((reports, errors))
     }
 
     /// Requests an algo order status report by client order identifier.
@@ -3907,29 +3929,41 @@ impl OKXHttpClient {
         &self.inner
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn collect_algo_reports(
         &self,
         account_id: AccountId,
         orders: &[OKXOrderAlgo],
+        params: &GetAlgoOrdersParams,
         instruments_cache: &mut AHashMap<Ustr, InstrumentAny>,
         ts_init: UnixNanos,
         seen: &mut AHashSet<(String, String)>,
         reports: &mut Vec<OrderStatusReport>,
+        errors: &mut Vec<String>,
     ) -> anyhow::Result<()> {
-        for order in orders {
-            let key = (order.algo_id.clone(), order.algo_cl_ord_id.clone());
-            if !seen.insert(key) {
+        for (row_index, order) in orders.iter().enumerate() {
+            // Scope filtering precedes cache lookup and conversion. An unrelated row
+            // is neither a positive match nor a failure of the requested lookup.
+            if order.inst_type != params.inst_type
+                || params
+                    .inst_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() != order.inst_id.as_str())
+                || params.algo_id.as_ref().is_some_and(|id| id != &order.algo_id)
+                || params
+                    .algo_cl_ord_id
+                    .as_ref()
+                    .is_some_and(|id| id != &order.algo_cl_ord_id)
+                || params.state.is_some_and(|state| state != order.state)
+            {
                 continue;
             }
-
+            let key = (order.algo_id.clone(), order.algo_cl_ord_id.clone());
             let instrument = if let Some(instrument) = instruments_cache.get(&order.inst_id) {
                 instrument.clone()
             } else {
                 let Ok(instrument) = self.instrument_from_cache(order.inst_id) else {
-                    log::debug!(
-                        "Skipping algo order report for instrument not in cache: symbol={}",
-                        order.inst_id,
-                    );
+                    errors.push(format!("algo:row={row_index}:instrument not cached"));
                     continue;
                 };
                 instruments_cache.insert(order.inst_id, instrument.clone());
@@ -3937,10 +3971,12 @@ impl OKXHttpClient {
             };
 
             match parse_http_algo_order(order, account_id, &instrument, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => {
-                    log::error!("Failed to parse algo order report: {e}");
+                Ok(report) => {
+                    if seen.insert(key) {
+                        reports.push(report);
+                    }
                 }
+                Err(_) => errors.push(format!("algo:row={row_index}:conversion failed")),
             }
         }
 
