@@ -2385,6 +2385,7 @@ async def test_reconnect_without_strict_collector_keeps_recovery_required(
 ):
     client, *_ = exec_client_builder(monkeypatch)
     await _connect_recovery_client(client, monkeypatch)
+    monkeypatch.setattr(client, "_mass_status_reports_complete", False)
     recover = AsyncMock()
     monkeypatch.setattr(client, "generate_mass_status", recover)
     client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
