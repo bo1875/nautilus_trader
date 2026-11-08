@@ -425,15 +425,35 @@ pub fn parse_book_msg_vec(
 ) -> anyhow::Result<Vec<Data>> {
     let mut deltas = Vec::with_capacity(data.len());
 
-    for msg in data {
-        let deltas_api = OrderBookDeltas_API::new(parse_book_msg(
-            &msg,
-            *instrument_id,
-            price_precision,
-            size_precision,
-            &action,
-            ts_init,
-        )?);
+    for (row, msg) in data.into_iter().enumerate() {
+        // OKX sends an unchanged sequence with empty sides as a keepalive.
+        // It carries no book mutation and must not discard neighboring updates.
+        if action == OKXBookAction::Update
+            && msg.asks.is_empty()
+            && msg.bids.is_empty()
+            && msg.prev_seq_id.and_then(|seq| u64::try_from(seq).ok()) == Some(msg.seq_id)
+        {
+            continue;
+        }
+        let deltas_api = OrderBookDeltas_API::new(
+            parse_book_msg(
+                &msg,
+                *instrument_id,
+                price_precision,
+                size_precision,
+                &action,
+                ts_init,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{instrument_id} {action:?} row={row} seq={} prev={:?} bids={} asks={}: {error}",
+                    msg.seq_id,
+                    msg.prev_seq_id,
+                    msg.bids.len(),
+                    msg.asks.len(),
+                )
+            })?,
+        );
         deltas.push(Data::Deltas(deltas_api));
     }
 
@@ -2103,6 +2123,99 @@ mod tests {
         } else {
             panic!("Expected Deltas");
         }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(123456)]
+    fn test_parse_book_vec_keepalive_has_no_mutation(#[case] sequence: u64) {
+        let msg: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": sequence,
+        }))
+        .unwrap();
+        let result = parse_book_msg_vec(
+            vec![msg],
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            OKXBookAction::Update,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_parse_book_vec_keepalive_preserves_neighbor(#[case] keepalive_first: bool) {
+        let event: OKXWsMessage =
+            serde_json::from_str(&load_test_json("ws_books_update.json")).unwrap();
+        let OKXWsMessage::BookData {
+            mut data, action, ..
+        } = event
+        else {
+            panic!("Expected BookData");
+        };
+        let sequence = if keepalive_first { 123456 } else { 123457 };
+        let keepalive: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": sequence,
+        }))
+        .unwrap();
+        if keepalive_first {
+            data.insert(0, keepalive);
+        } else {
+            data.push(keepalive);
+        }
+        let result = parse_book_msg_vec(
+            data,
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            action,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let Data::Deltas(delta) = &result[0] else {
+            panic!("Expected Deltas");
+        };
+        assert_eq!(delta.sequence, 123457);
+        assert_eq!(delta.deltas.len(), 16);
+    }
+
+    #[rstest]
+    #[case(OKXBookAction::Snapshot, Some(10), 10)]
+    #[case(OKXBookAction::Update, Some(9), 10)]
+    #[case(OKXBookAction::Update, None, 10)]
+    #[case(OKXBookAction::Update, Some(-1), u64::MAX)]
+    fn test_parse_book_vec_invalid_empty_still_rejected(
+        #[case] action: OKXBookAction,
+        #[case] previous: Option<i64>,
+        #[case] sequence: u64,
+    ) {
+        let msg: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": previous,
+        }))
+        .unwrap();
+        let error = parse_book_msg_vec(
+            vec![msg],
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            action,
+            UnixNanos::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deltas"));
+        assert!(error.contains("row=0"));
+        assert!(error.contains(&format!("seq={sequence}")));
+        assert!(error.contains(&format!("prev={previous:?}")));
+        assert!(error.contains("bids=0 asks=0"));
     }
 
     #[rstest]
