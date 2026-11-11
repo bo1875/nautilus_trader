@@ -20,8 +20,10 @@ from asyncio import Queue
 from collections import Counter
 from collections.abc import Iterable
 from decimal import Decimal
+from time import monotonic_ns
 from typing import Any
 from typing import Final
+from typing import NamedTuple
 from typing import cast
 
 import pandas as pd
@@ -53,6 +55,7 @@ from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
 from nautilus_trader.execution.reports import PositionStatusReport
 from nautilus_trader.live.enqueue import ThrottledEnqueuer
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.live.reconciliation import adjust_fills_for_partial_window
 from nautilus_trader.live.reconciliation import calculate_reconciliation_price
 from nautilus_trader.live.reconciliation import create_inferred_order_filled_event
@@ -76,6 +79,7 @@ from nautilus_trader.model.enums import trigger_type_to_str
 from nautilus_trader.model.events import OrderEvent
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
+from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -91,6 +95,40 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders import OrderUnpacker
 from nautilus_trader.model.position import Position
+
+
+class OrderApplyObservation(NamedTuple):
+    """Local engine boundary, joined to transport diagnostics by event_id only."""
+
+    event_id: str
+    client_order_id: str
+    ts_observed_ns: int
+    outcome: str
+    observations_dropped: int
+
+
+class ExecutionCaptureStatus(NamedTuple):
+    """Dated producer counters, not trading success or delivery certification."""
+
+    schema_version: int
+    scope: str
+    scope_id: str
+    connection_generation: int | None
+    ts_observed_ns: int
+    window_start_ns: int
+    window_duration_ns: int
+    window_limit: int
+    window_attempts: int
+    total_attempts: int
+    observations_dropped: int
+    status_sequence: int
+    state: str
+
+
+_CAPTURE_WINDOW_NS = 60_000_000_000
+_CAPTURE_LIMIT = 4096
+_CAPTURE_STATUS_SECS = 5.0
+_CAPTURE_COUNTER_MAX = (1 << 64) - 1
 
 
 class LiveExecutionEngine(ExecutionEngine):
@@ -144,11 +182,24 @@ class LiveExecutionEngine(ExecutionEngine):
         # Reconciliation
         self._recon_check_retries: Counter[ClientOrderId] = Counter()
         self._ts_last_query: dict[ClientOrderId, int] = {}
+        # Receipt fences exist only while absence queries are outstanding.
+        self._pending_absence_queries: dict[ClientOrderId, set[object]] = {}
         self._order_local_activity_ns: dict[ClientOrderId, int] = {}
         self._position_local_activity_ns: dict[InstrumentId, int] = {}
         self._position_recon_retries: Counter[InstrumentId] = Counter()
         self._recent_fills_cache: dict[TradeId, int] = {}  # TradeId -> timestamp_ns (TTL cache)
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
+        self._apply_observations_emitted = 0
+        self._apply_observations_dropped = 0
+        self._apply_observations_total = 0
+        self._capture_scope_id = str(UUID4())
+        self._capture_window_mono = monotonic_ns()
+        self._capture_window_date = self._clock.timestamp_ns()
+        self._capture_status_sequence = 0
+        self._capture_status_failures = 0
+        self._capture_status_handle: asyncio.TimerHandle | None = None
+        self._capture_run: object | None = None
+        self._capture_closed_status: ExecutionCaptureStatus | None = None
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
         self._filtered_external_orders_count: int = 0
@@ -379,7 +430,11 @@ class LiveExecutionEngine(ExecutionEngine):
         self._is_shutting_down = False
 
         self._cmd_queue_task = self._loop.create_task(self._run_cmd_queue(), name="cmd_queue")
-        self._evt_queue_task = self._loop.create_task(self._run_evt_queue(), name="evt_queue")
+        self._start_capture_status()
+        self._evt_queue_task = self._loop.create_task(
+            self._run_evt_queue(self._capture_run),
+            name="evt_queue",
+        )
         self._log.debug(f"Scheduled task '{self._cmd_queue_task.get_name()}'")
         self._log.debug(f"Scheduled task '{self._evt_queue_task.get_name()}'")
 
@@ -460,6 +515,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
     def _on_stop(self) -> None:
         self._is_shutting_down = True
+        self._cancel_capture_status_timer()
 
         if self._reconciliation_task:
             self._log.debug(f"Canceling task '{self._reconciliation_task.get_name()}'")
@@ -513,6 +569,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.warning("Killing engine")
         self._kill = True
         self.stop()
+        self._close_capture_status(self._capture_run)
 
         if self._cmd_queue_task:
             self._log.debug(f"Canceling task '{self._cmd_queue_task.get_name()}'")
@@ -583,7 +640,7 @@ class LiveExecutionEngine(ExecutionEngine):
             else:
                 self._log.debug(stopped_msg)
 
-    async def _run_evt_queue(self) -> None:
+    async def _run_evt_queue(self, capture_run: object | None = None) -> None:
         self._log.debug(
             f"Event message queue processing starting (qsize={self.evt_qsize()})",
         )
@@ -601,6 +658,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 except Exception as e:
                     self._handle_queue_exception(e, "event")
         finally:
+            self._close_capture_status(capture_run)
             stopped_msg = "Event message queue stopped"
 
             if not self._evt_queue.empty():
@@ -819,10 +877,11 @@ class LiveExecutionEngine(ExecutionEngine):
 
                 self._log.warning(
                     f"Order {order.client_order_id!r} exceeded max inflight retries ({retries}), "
-                    f"resolving as failed",
+                    f"checking venue before resolution",
                     LogColor.YELLOW,
                 )
-                self._resolve_inflight_order(order)
+                if await self._query_order_absence(order):
+                    self._resolve_inflight_order(order)
             else:
                 self._log.debug(f"Querying {order} with venue...")
                 query_ts = self._clock.timestamp_ns()
@@ -1290,7 +1349,11 @@ class LiveExecutionEngine(ExecutionEngine):
                 self._log.debug("No execution clients to check orders consistency, early return")
                 return
 
-            all_order_reports, venue_reported_ids = await self._query_order_status_reports()
+            try:
+                all_order_reports, venue_reported_ids = await self._query_order_status_reports()
+            except IncompleteOrderStatusReports as e:
+                self._reconcile_order_reports(e.reports, open_order_ids)
+                return  # Positive observations do not certify absence for this cycle.
 
             self._reconcile_order_reports(all_order_reports, open_order_ids)
 
@@ -1401,23 +1464,23 @@ class LiveExecutionEngine(ExecutionEngine):
                     f"Order {client_order_id!r} not found at venue, retry {retries + 1}/{self.open_check_missing_retries}",
                 )
 
-    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
-        ts_now = self._clock.timestamp_ns()
-
-        self._log.debug(
-            f"Performing single-order query for {order.client_order_id!r} before marking as REJECTED",
-            LogColor.BLUE,
-        )
-
+    async def _query_order_absence(self, order: Order) -> bool:
+        # Only a complete negative response for unchanged local state establishes absence.
         client_id = self._cache.client_id(order.client_order_id)
         if client_id is None:
             self._log.warning(
                 f"No client_id found for {order.client_order_id!r}, skipping targeted query",
             )
-            # Skip targeted query but proceed with resolution
+            return False  # Without a query there is no evidence of absence.
         else:
             client = self._clients.get(client_id)
+            if client is None:
+                self._log.warning(f"No execution client for {order.client_order_id!r}; unresolved")
+                return False
 
+            phase = "query"
+            query_token = object()
+            self._pending_absence_queries.setdefault(order.client_order_id, set()).add(query_token)
             try:
                 query_ts = self._clock.timestamp_ns()
                 command = GenerateOrderStatusReport(
@@ -1429,17 +1492,56 @@ class LiveExecutionEngine(ExecutionEngine):
                 )
 
                 self._ts_last_query[order.client_order_id] = query_ts
+                last_event = order.last_event
+                local_activity = self._order_local_activity_ns.get(order.client_order_id)
                 report = await client.generate_order_status_report(command)
+                observed_during_query = query_token not in self._pending_absence_queries.get(
+                    order.client_order_id,
+                    (),
+                )
+                if report is not None:
+                    self._record_order_report_receipt(report)
+                if (
+                    observed_during_query
+                    or order.last_event is not last_event
+                    or self._order_local_activity_ns.get(order.client_order_id) != local_activity
+                ):
+                    self._log.debug(
+                        f"Deferring resolution for {order.client_order_id!r}: activity during query",
+                    )
+                    return False
                 if report is not None:
                     self._log.info(
                         f"Found {order.client_order_id!r} via targeted query: {report.order_status}",
                         LogColor.BLUE,
                     )
+                    phase = "reconcile"
                     self._reconcile_order_report(report, trades=[])
-                    return  # Order found and reconciled, no need to mark as rejected
+                    return False  # A positive report cannot establish absence.
+            except IncompleteOrderStatusReports as e:
+                for report in e.reports:
+                    self._record_order_report_receipt(report)
+                return False
             except Exception as e:
-                self._log.warning(f"Error during targeted query for {order.client_order_id!r}: {e}")
+                self._log.warning(
+                    f"Targeted order resolution unresolved for {order.client_order_id!r}: "
+                    f"phase={phase}, error={type(e).__name__}",
+                )
+                return False
+            finally:
+                pending = self._pending_absence_queries.get(order.client_order_id)
+                if pending is not None:
+                    pending.discard(query_token)
+                    if not pending:
+                        self._pending_absence_queries.pop(order.client_order_id, None)
 
+        return True
+
+    async def _resolve_order_not_found_at_venue(self, order: Order) -> None:
+        if not await self._query_order_absence(order):
+            return
+
+        ts_now = self._clock.timestamp_ns()
         if not order.is_open:
             self._log.debug(
                 f"Skipping reconciliation for {order.client_order_id!r} - already {order.status_string()}",
@@ -1531,26 +1633,41 @@ class LiveExecutionEngine(ExecutionEngine):
 
         clients = self._clients.values()
 
-        tasks = [
-            c.generate_order_status_reports(
-                GenerateOrderStatusReports(
-                    instrument_id=None,
-                    start=order_status_start,
-                    end=None,
-                    open_only=self.open_check_open_only,
-                    command_id=UUID4(),
-                    ts_init=self._clock.timestamp_ns(),
-                    log_receipt_level=LogLevel.DEBUG,
-                ),
-            )
-            for c in clients
-        ]
+        async def query(client: ExecutionClient) -> list[OrderStatusReport]:
+            try:
+                reports = await client.generate_order_status_reports(
+                    GenerateOrderStatusReports(
+                        instrument_id=None,
+                        start=order_status_start,
+                        end=None,
+                        open_only=self.open_check_open_only,
+                        command_id=UUID4(),
+                        ts_init=self._clock.timestamp_ns(),
+                        log_receipt_level=LogLevel.DEBUG,
+                    ),
+                )
+            except IncompleteOrderStatusReports as e:
+                for report in e.reports:
+                    self._record_order_report_receipt(report)
+                raise
+            # Do not wait for other clients before acknowledging positive receipt.
+            for report in reports:
+                self._record_order_report_receipt(report)
+            return reports
+
+        tasks = [query(client) for client in clients]
 
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
 
+        incomplete = False
         for reports_or_exception in order_reports_all:
+            if isinstance(reports_or_exception, asyncio.CancelledError):
+                raise reports_or_exception
             if isinstance(reports_or_exception, Exception):
+                incomplete = True
+                if isinstance(reports_or_exception, IncompleteOrderStatusReports):
+                    all_order_reports.extend(reports_or_exception.reports)
                 self._log.error(
                     f"Failed to generate order status reports: {reports_or_exception}",
                 )
@@ -1558,6 +1675,9 @@ class LiveExecutionEngine(ExecutionEngine):
 
             reports = cast(list[OrderStatusReport], reports_or_exception)
             all_order_reports.extend(reports)
+
+        if incomplete:
+            raise IncompleteOrderStatusReports(all_order_reports)
 
         venue_reported_ids: set[ClientOrderId] = {
             report.client_order_id
@@ -1572,6 +1692,10 @@ class LiveExecutionEngine(ExecutionEngine):
         all_order_reports: list[OrderStatusReport],
         open_order_ids: set[ClientOrderId],
     ) -> None:
+        # Record the whole collection before any application can abort the pass.
+        for report in all_order_reports:
+            self._record_order_report_receipt(report)
+
         ts_now = self._clock.timestamp_ns()
 
         for report in all_order_reports:
@@ -1813,6 +1937,9 @@ class LiveExecutionEngine(ExecutionEngine):
         Reconcile a single execution report received at runtime, routing to appropriate
         reconciliation method based on report type.
         """
+        if isinstance(report, (OrderStatusReport, FillReport)):
+            self._record_order_report_receipt(report)
+
         self._log.debug(f"<--[RPT] {report}")
         self.report_count += 1
 
@@ -1853,6 +1980,13 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         mass_status: ExecutionMassStatus,
     ) -> bool:
+        # Receipt is evidence even if preprocessing or an earlier row fails.
+        for report in mass_status.order_reports.values():
+            self._record_order_report_receipt(report)
+        for fills in mass_status.fill_reports.values():
+            for fill in fills:
+                self._record_order_report_receipt(fill)
+
         self._log.debug(f"<--[RPT] {mass_status}")
         self.report_count += 1
 
@@ -3131,10 +3265,27 @@ class LiveExecutionEngine(ExecutionEngine):
             return True  # Reconciled
 
         if report.order_status == OrderStatus.ACCEPTED:
-            if order.status != OrderStatus.ACCEPTED:
+            # A live snapshot confirms terms, not a new acceptance or the outcome
+            # of an outstanding request. Never reopen a terminal order.
+            if order.is_closed:
+                return True
+            if report.quantity < order.filled_qty:
+                return False
+            confirmed_ts = max(
+                (
+                    event.ts_event
+                    for event in order.events
+                    if isinstance(event, (OrderUpdated, OrderFilled))
+                ),
+                default=0,
+            )
+            if report.ts_last < confirmed_ts:
+                return True
+            if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
                 self._generate_order_accepted(order, report)
-
-            return True  # Reconciled
+            if self._should_update(order, report):
+                self._generate_order_updated(order, report)
+            return True
 
         # Order must have been accepted from this point
         if order.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED):
@@ -3571,8 +3722,49 @@ class LiveExecutionEngine(ExecutionEngine):
             self._ts_last_query.pop(client_order_id, None)
 
     def _handle_event_with_tracking(self, event: OrderEvent) -> None:
-        # Handle an order event with activity tracking, recording fills in cache and
-        # cleaning up tracking data for closed orders.
+        # Validate terms again at application: a fill or terminal event may have
+        # reached the engine after the adapter produced this update. Authoritative
+        # reconciliation can correct a canceled order before real late fills;
+        # applying terms alone leaves it canceled. Websocket updates cannot do this.
+        before_id = None
+        if isinstance(event, OrderUpdated):
+            order = self._cache.order(event.client_order_id)
+            if order is not None:
+                before_id = order.last_event.id
+                confirmed_ts = max(
+                    (
+                        item.ts_event
+                        for item in order.events
+                        if isinstance(item, (OrderUpdated, OrderFilled))
+                    ),
+                    default=0,
+                )
+                reason = None
+                if order.is_closed and not (
+                    order.status == OrderStatus.CANCELED and event.reconciliation
+                ):
+                    reason = "terminal"
+                elif event.quantity < order.filled_qty:
+                    reason = "below_filled"
+                elif any(item.id == event.id for item in order.events):
+                    reason = "duplicate"
+                elif event.ts_event < confirmed_ts:
+                    reason = "stale"
+                elif (
+                    event.quantity == order.quantity
+                    and (event.venue_order_id is None or event.venue_order_id == order.venue_order_id)
+                    and (event.price is None or (order.has_price and event.price == order.price))
+                    and (
+                        event.trigger_price is None
+                        or (order.has_trigger_price and event.trigger_price == order.trigger_price)
+                    )
+                ):
+                    # A first authoritative snapshot may repeat the cached terms.
+                    # It is not confirmation of a newer pending operation.
+                    reason = "unchanged"
+                if reason is not None:
+                    self._observe_order_apply(event, reason)
+                    return
         self._record_local_activity(event)
 
         if isinstance(event, OrderFilled):
@@ -3585,7 +3777,21 @@ class LiveExecutionEngine(ExecutionEngine):
                 if client_order_id not in self._inferred_fill_ts:
                     self._inferred_fill_ts[client_order_id] = event.ts_event
 
-        self._handle_event(event)
+        outcome = "error"
+        try:
+            self._handle_event(event)
+            if isinstance(event, OrderUpdated):
+                order = self._cache.order(event.client_order_id)
+                outcome = (
+                    "applied"
+                    if order is not None
+                    and order.last_event.id == event.id
+                    and before_id != event.id
+                    else "not_applied"
+                )
+        finally:
+            if isinstance(event, OrderUpdated):
+                self._observe_order_apply(event, outcome)
 
         if event.client_order_id is None:
             return
@@ -3596,6 +3802,132 @@ class LiveExecutionEngine(ExecutionEngine):
             self._order_local_activity_ns.pop(order.client_order_id, None)
             self._inferred_fill_ts.pop(order.client_order_id, None)
             self._fill_application_audit.pop(order.client_order_id, None)
+
+    def _refresh_capture_window(self) -> None:
+        if self._capture_closed_status is not None:
+            return
+        elapsed = max(0, monotonic_ns() - self._capture_window_mono)
+        windows = elapsed // _CAPTURE_WINDOW_NS
+        if windows:
+            advance = windows * _CAPTURE_WINDOW_NS
+            self._capture_window_mono += advance
+            self._capture_window_date += advance
+            self._apply_observations_emitted = 0
+
+    def _capture_status(self) -> ExecutionCaptureStatus:
+        if self._capture_closed_status is not None:
+            return self._capture_closed_status
+        self._refresh_capture_window()
+        self._capture_status_sequence = min(_CAPTURE_COUNTER_MAX, self._capture_status_sequence + 1)
+        return ExecutionCaptureStatus(
+            1,
+            "native_apply",
+            self._capture_scope_id,
+            None,
+            self._clock.timestamp_ns(),
+            self._capture_window_date,
+            _CAPTURE_WINDOW_NS,
+            _CAPTURE_LIMIT,
+            self._apply_observations_emitted,
+            self._apply_observations_total,
+            self._apply_observations_dropped,
+            self._capture_status_sequence,
+            "exhausted" if self._apply_observations_emitted >= _CAPTURE_LIMIT else "active",
+        )
+
+    def _publish_capture_status(self, status: ExecutionCaptureStatus) -> None:
+        try:
+            self._msgbus.publish(topic="execution.capture_status", msg=status)
+        except Exception:
+            self._capture_status_failures = min(
+                _CAPTURE_COUNTER_MAX, self._capture_status_failures + 1
+            )
+
+    def _cancel_capture_status_timer(self) -> None:
+        if self._capture_status_handle is not None:
+            self._capture_status_handle.cancel()
+            self._capture_status_handle = None
+
+    def _start_capture_status(self) -> None:
+        self._cancel_capture_status_timer()
+        if self._capture_run is None or self._capture_closed_status is not None:
+            self._capture_window_mono = monotonic_ns()
+            self._capture_window_date = self._clock.timestamp_ns()
+            self._apply_observations_emitted = 0
+        self._capture_closed_status = None
+        self._capture_run = object()
+        self._capture_status_tick(self._capture_run)
+
+    def _capture_status_tick(self, capture_run: object) -> None:
+        if capture_run is not self._capture_run or self._is_shutting_down:
+            return
+        self._capture_status_handle = None
+        self._publish_capture_status(self._capture_status())
+        # One handle, scheduled after the offer. No catch-up or per-event work.
+        if capture_run is self._capture_run and not self._is_shutting_down:
+            self._capture_status_handle = self._loop.call_later(
+                _CAPTURE_STATUS_SECS,
+                self._capture_status_tick,
+                capture_run,
+            )
+
+    def _close_capture_status(self, capture_run: object | None) -> None:
+        if capture_run is not self._capture_run or self._capture_closed_status is not None:
+            return
+        self._cancel_capture_status_timer()
+        self._capture_closed_status = self._capture_status()._replace(state="closed")
+        self._publish_capture_status(self._capture_closed_status)
+
+    def _observe_order_apply(self, event: OrderUpdated, outcome: str) -> None:
+        # Capture failure never changes order processing. Subscribers must enqueue
+        # without blocking. The window replenishes independently of reconnect.
+        if self._capture_closed_status is not None:
+            return
+        self._refresh_capture_window()
+        if self._apply_observations_emitted >= _CAPTURE_LIMIT:
+            self._apply_observations_dropped = min(
+                _CAPTURE_COUNTER_MAX, self._apply_observations_dropped + 1
+            )
+            return
+        self._apply_observations_emitted += 1
+        self._apply_observations_total = min(
+            _CAPTURE_COUNTER_MAX, self._apply_observations_total + 1
+        )
+        try:
+            self._msgbus.publish(
+                topic="execution.order_apply_observation",
+                msg=OrderApplyObservation(
+                    str(event.id),
+                    str(event.client_order_id),
+                    self._clock.timestamp_ns(),
+                    outcome,
+                    self._apply_observations_dropped,
+                ),
+            )
+        except Exception:
+            self._apply_observations_dropped = min(
+                _CAPTURE_COUNTER_MAX, self._apply_observations_dropped + 1
+            )
+
+    def _record_order_report_receipt(self, report: OrderStatusReport | FillReport) -> None:
+        if not self._pending_absence_queries:
+            return
+
+        for client_order_id in (
+            report.client_order_id,
+            self._cache.client_order_id(report.venue_order_id),
+        ):
+            if client_order_id not in self._pending_absence_queries:
+                continue
+            order = self._cache.order(client_order_id)
+            if (
+                order is not None
+                and order.instrument_id == report.instrument_id
+                and (order.account_id is None or order.account_id == report.account_id)
+            ):
+                # Invalidate every older query for this order, including concurrent queries.
+                # New queries receive new tokens; no observation history is retained.
+                self._pending_absence_queries.pop(client_order_id, None)
 
     def _record_local_activity(self, event: OrderEvent | None) -> None:
         if event is None:

@@ -378,6 +378,53 @@ Only use manual override if you have specific requirements that cannot be met th
 | Order status updates | ✓                     | Real-time order state changes.            |
 | Trade history        | ✓                     | Execution and fill reports.               |
 
+`generate_order_status_reports` returns a list only when the requested query completes.
+Transport, instrument-cache and conversion failures raise `IncompleteOrderStatusReports`
+(from `nautilus_trader.live.reconciliation`). Its `reports` attribute retains valid
+positive observations, including reports collected before another instrument type fails.
+Callers may apply these observations, but must not infer absence or successful completion
+from this list. Cancellation propagates as `asyncio.CancelledError`.
+
+`generate_order_status_report` may return a matching positive observation from an
+incomplete query. Without a match it raises; it returns `None` only after a successful
+negative query within the existing endpoint and history scope. Algo fallback failures
+also propagate. A regular query with no matching order still checks the requested client
+identity through the algo fallback, even when the regular result is empty. This changes
+the previous error-to-empty/error-to-None behavior; wrappers must retain unresolved state
+on exceptions. Regular queries use `request_order_status_reports_with_errors`.
+
+Algo queries require the additive Rust/PyO3
+`request_algo_order_status_reports_with_errors` method. It accepts the same filters as
+`request_algo_order_status_reports` and returns `(reports, errors)`. Only `([], [])`
+establishes a complete negative within the requested endpoint scope. Conversion, cache,
+endpoint and saturated-page failures retain usable observations with nonempty errors;
+rows outside the requested filters do not count as failures. The adapter checks both
+client identifiers and known algo identifiers, returns a matching positive even if
+another branch failed, and raises `IncompleteOrderStatusReports` when unmatched coverage
+is incomplete. Cancellation
+propagates. A missing strict method on an older binary raises rather than falling back
+to an empty result, so this Python adapter requires a binary built with the new method.
+The legacy algo list and singular methods keep their return types but now raise on
+incomplete reads instead of silently omitting rows.
+
+Fill and position readers also use the existing strict Rust report methods and propagate
+failures. The optional SPOT wallet reader propagates query and conversion failures;
+verified zero or sub-increment balances still produce flat reports. The static
+`OKXExecutionClient._mass_status_reports_complete` capability identifies this reader
+contract. It is never a last-call success flag: each `generate_mass_status` invocation
+returns a report only when all its readers succeed, returns `None` on failure, and
+propagates cancellation. An overlapping successful call cannot certify a failed call.
+
+The live engine applies positive bulk observations while skipping absence checks for an
+incomplete cycle. At the inflight retry limit it performs a final targeted query before
+resolving an order. Failed reads, failed local application, missing clients, and local
+activity during that query leave the order unresolved. Matching positive order/fill report
+receipt also invalidates outstanding absence queries before application, including when
+application is a no-op or fails. This covers individual reports and complete/incomplete
+collections, including positives retained by a failed targeted query for another order.
+It retains only active query tokens, not a history of observations. A later
+query can still establish qualified absence. Retry and timer settings remain unchanged.
+
 ### Contingent orders
 
 | Feature             | Linear Perpetual Swap | Notes                                      |
@@ -661,3 +708,94 @@ node.build()
 For additional features or to contribute to the OKX adapter, please see our
 [contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
 :::
+
+### Confirmed order terms and diagnostics
+
+The first orders-channel snapshot delivers confirmed price and quantity to the
+native cache even when a placement response already emitted acceptance, and
+before any fill carried by that snapshot. A successful amend response still
+only retires transport correlation; it does not confirm terms. ACCEPTED status
+reports reconcile changed terms without generating another acceptance for an
+open or pending order. Unchanged or older reports leave pending operations alone.
+Equal venue timestamps do not identify duplicates: differing authoritative
+terms at the same millisecond can apply. Strictly older terms remain fenced.
+Already applied update UUIDs are checked against the existing order history.
+Websocket updates cannot change terminal orders. Authoritative reconciliation
+may correct a canceled order's terms before real late fills; the terms update
+alone leaves it canceled. No update can reduce quantity below fills.
+Periodic reconciliation remains necessary for missing messages and recovery.
+
+`OKXRequestObservation` retains schema 1 request fields and adds optional
+`event_id`, `ts_received_ns`, `ts_venue_ns`, `observed_price`, and `observed_size`
+getters. Schema 2 orders observations pass through the same
+`_handle_ws_request_observation` hook. They describe decoded receipt before
+filtering and the forward/drop decision. An emitted lifecycle event carries its
+actual UUID; reports and dropped observations have no event UUID. An empty
+request ID and zero handler timestamp mean unknown, never a duration anchor.
+An orders push does not identify the operation which caused it. Matching terms
+or order IDs alone must not be interpreted as an operation acknowledgement.
+
+Local timestamps are UNIX nanoseconds. Receipt is the handler's decoded-frame
+boundary, not socket arrival; handler registration is not caller intent, and
+send completion is a local transport return. Venue time is a separate clock.
+Diagnostic callbacks can arrive on a different scheduling path from lifecycle
+events; UUID correlation does not imply callback order.
+
+The live execution engine publishes immutable `OrderApplyObservation` tuples on
+`execution.order_apply_observation`: `event_id`, `client_order_id`,
+`ts_observed_ns`, `outcome`, and `observations_dropped`. `applied` means that the
+native cache accepted that event UUID, not durable persistence or settlement.
+Other outcomes are `not_applied`, `error`, `stale`, `terminal`, `below_filled`, and
+`duplicate` and `unchanged`. `unchanged` means no cached event or terms were
+mutated and a pending operation remains pending; it does not acknowledge that
+operation. Subscribers must enqueue without blocking. Subscriber errors do
+not change lifecycle processing. No correlation history is retained.
+
+Ordinary transport and engine apply diagnostics each admit 4,096 publication
+attempts per monotonic 60-second window. They resume without reconnect or
+restart. Reconnect also opens a transport window; engine windows are independent.
+Cumulative refused/failed attempts never reset at rollover or reconnect.
+Reconnect details remain capped at 128. Existing output queues remain unbounded;
+these limits do not bound process memory or certify complete coverage.
+
+Independent capture status remains available after ordinary event exhaustion.
+`OKXWebSocketClient.capture_status()` reads one latest immutable
+`OKXCaptureStatus` without queueing messages or doing network I/O. The Python
+execution client offers it through `_handle_ws_capture_status` every five
+seconds. The engine publishes `ExecutionCaptureStatus` on
+`execution.capture_status` with the same cadence. Each owner uses one lifecycle
+timer, rescheduled after its callback: delayed callbacks coalesce, without
+catch-up tasks. Subscribers must enqueue without blocking. Status failures are
+separate from ordinary refused counts and cannot change lifecycle processing.
+
+Both immutable status types expose these scalar fields:
+
+| Fields | Meaning |
+|---|---|
+| `schema_version`, `scope`, `scope_id` | Version 1; `okx_transport` handler identity or `native_apply` engine identity. |
+| `connection_generation` | Transport reconnect generation; `None` for the engine. |
+| `ts_observed_ns`, `window_start_ns` | Local UNIX snapshot date and diagnostic window opening date. Retention must preserve the original snapshot date. |
+| `window_duration_ns`, `window_limit`, `window_attempts` | 60-second duration, 4,096 limit, admitted attempts in the current window. |
+| `total_attempts`, `observations_dropped` | Scope-cumulative admitted publication attempts and refused/failed ordinary attempts. Local emission failure contributes to both; they are not a conservation equation. |
+| `status_sequence`, `state` | Prepared snapshot sequence and `active`, `exhausted`, or `closed`. Neither sequence nor active state certifies delivery. |
+
+Budget rollover uses monotonic elapsed time; changing the wall clock does not
+renew capacity. Window dates follow that monotonic window's original wall-clock
+anchor, so a wall-clock adjustment can put a window date ahead of a snapshot
+date. Getter reads cannot grant additional capacity. A current zero-attempt
+window describes only what this producer observed; an old or missing status
+cannot establish current availability or absence of trading events.
+
+Stop cancels periodic capture. The engine's existing event-queue finalizer
+freezes one closed snapshot after drain or cancellation; kill closes capture
+without asserting a successful drain. Transport close likewise freezes its
+final snapshot. Later reads preserve that date and sequence. Reusing an engine
+through its normal reset/start lifecycle preserves scope identity, cumulative
+counters and sequence, while opening a new window and retaining only one timer.
+A new engine or handler has a new scope. Closed status is not trading success,
+persistence, settlement, or tick-to-native invocation coverage.
+
+These changes build on the request/reconnect contract in PR #3. Automatic native
+reconnect readback additionally requires the strict all-reader completeness
+contract in PR #4. Neither diagnostics nor source availability qualifies a
+packaged deployment or replaces an integration's recovery owner.

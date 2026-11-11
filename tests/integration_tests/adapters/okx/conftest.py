@@ -189,8 +189,12 @@ def mock_http_client():
     mock.request_account_state = AsyncMock(return_value=mock_account_state)
 
     mock.request_order_status_reports = AsyncMock(return_value=[])
+    mock.request_order_status_reports_with_errors = AsyncMock(return_value=([], []))
+    mock.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
     mock.request_fill_reports = AsyncMock(return_value=[])
+    mock.request_fill_reports_with_errors = AsyncMock(return_value=([], []))
     mock.request_position_status_reports = AsyncMock(return_value=[])
+    mock.request_position_status_reports_with_errors = AsyncMock(return_value=([], []))
     mock.request_trades = AsyncMock(return_value=[])
     mock.request_bars = AsyncMock(return_value=[])
 
@@ -232,6 +236,7 @@ def _create_ws_mock() -> MagicMock:
     mock.get_subscriptions = MagicMock(return_value=[])
     mock.subscribe_orders = AsyncMock()
     mock.subscribe_orders_algo = AsyncMock()
+    mock.subscribe_algo_advance = AsyncMock()
     mock.subscribe_fills = AsyncMock()
     mock.subscribe_account = AsyncMock()
     mock.batch_cancel_orders = AsyncMock()

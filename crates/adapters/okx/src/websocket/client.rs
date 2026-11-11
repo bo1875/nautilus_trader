@@ -32,8 +32,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use super::capture::{CaptureSlot, OKXCaptureStatus, close_capture, read_capture};
 use ahash::AHashSet;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use futures_util::Stream;
 use nautilus_common::live::get_runtime;
@@ -167,6 +168,7 @@ pub struct OKXWebSocketClient {
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
     inst_id_code_cache: Arc<DashMap<Ustr, u64>>,
     cancellation_token: CancellationToken,
+    pub(super) capture_state: CaptureSlot,
 }
 
 impl Default for OKXWebSocketClient {
@@ -248,6 +250,7 @@ impl OKXWebSocketClient {
             instruments_cache: Arc::new(DashMap::new()),
             inst_id_code_cache: Arc::new(DashMap::new()),
             cancellation_token: CancellationToken::new(),
+            capture_state: Arc::new(ArcSwapOption::empty()),
         })
     }
 
@@ -512,6 +515,7 @@ impl OKXWebSocketClient {
         let inst_id_code_cache = self.inst_id_code_cache.clone();
         let request_id_counter = self.request_id_counter.clone();
 
+        let capture_state = self.capture_state.clone();
         let stream_handle = get_runtime().spawn({
             let auth_tracker = auth_tracker.clone();
             let signal = signal.clone();
@@ -537,6 +541,10 @@ impl OKXWebSocketClient {
                     subscriptions_state.clone(),
                     request_id_counter,
                 );
+
+                handler.publish_capture_state();
+                capture_state.store(handler.capture_state.load_full());
+                handler.capture_state = capture_state;
 
                 // Helper closure to resubscribe all tracked subscriptions after reconnection
                 let resubscribe_all = || {
@@ -606,7 +614,7 @@ impl OKXWebSocketClient {
                 // Main message loop with explicit reconnection handling
                 loop {
                     match handler.next().await {
-                        Some(NautilusWsMessage::Reconnected) => {
+                        Some(NautilusWsMessage::Reconnected(event)) => {
                             if signal.load(Ordering::Acquire) {
                                 continue;
                             }
@@ -672,9 +680,10 @@ impl OKXWebSocketClient {
                                 resubscribe_all();
                             }
 
-                            // TODO: Implement proper Reconnected event forwarding to consumers.
-                            // Currently intercepted for internal housekeeping only. Will add new
-                            // message type from WebSocketClient to notify consumers of reconnections.
+                            if handler.send(NautilusWsMessage::Reconnected(event)).is_err() {
+                                log::error!("Reconnect recovery consumer dropped");
+                                break;
+                            }
                         }
                         Some(NautilusWsMessage::Authenticated) => {
                             if has_reconnected {
@@ -876,9 +885,16 @@ impl OKXWebSocketClient {
             log::debug!("No stream handle to await");
         }
 
+        close_capture(&self.capture_state, None);
         log::debug!("Close process completed");
 
         Ok(())
+    }
+
+    /// Read a coherent latest producer snapshot without scheduling or network I/O.
+    #[must_use]
+    pub fn capture_status(&self) -> Option<OKXCaptureStatus> {
+        read_capture(&self.capture_state)
     }
 
     /// Get active subscriptions for a specific instrument.
