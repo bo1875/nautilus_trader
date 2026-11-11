@@ -53,7 +53,9 @@ jobs:
           clang++ --version
           rustc --version
       - name: Test OKX Rust contracts
-        run: cargo test --locked --release -p nautilus-okx --features python --lib -- --test-threads=1
+        run: cargo test --locked --release -p nautilus-okx --features python,high-precision --lib -- --test-threads=1
+      - name: Test local websocket reconnect boundary
+        run: CARGO_PROFILE_RELEASE_PANIC=unwind cargo test --locked --release -p nautilus-okx --features python,high-precision --test websocket test_true_auto_reconnect_with_verification -- --exact --test-threads=1
       - name: Build wheel
         run: |
           python -I -m build "$GITHUB_WORKSPACE" --wheel --no-isolation --outdir /tmp/raw-wheels
@@ -71,7 +73,7 @@ jobs:
           cd /tmp/native-contracts
           export PYTHONPATH="$PWD" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
           export OKX_API_KEY=synthetic-offline OKX_API_SECRET=synthetic-offline OKX_API_PASSPHRASE=synthetic-offline
-          /tmp/qualification/bin/python -I -c 'from importlib.metadata import version; import nautilus_trader as n; from nautilus_trader.core import nautilus_pyo3 as r; assert version("nautilus_trader") == n.__version__ == r.NAUTILUS_VERSION == "1.224.0+fork.2"; assert n.__file__.startswith("/tmp/qualification/")'
+          /tmp/qualification/bin/python -I -c 'from importlib.metadata import version; import nautilus_trader as n; from nautilus_trader.core import nautilus_pyo3 as r; assert version("nautilus_trader") == n.__version__ == r.NAUTILUS_VERSION == "1.224.0+fork.3"; assert n.__file__.startswith("/tmp/qualification/")'
           /tmp/qualification/bin/python -m pytest -q --rootdir=. -p no:cacheprovider -p pytest_asyncio.plugin -p pytest_mock --runxfail -c /dev/null fork_tests --junitxml=/tmp/public-wheels/native-tests.xml
           /tmp/qualification/bin/python -m pytest -q --rootdir=. -p no:cacheprovider -p pytest_asyncio.plugin -p pytest_mock -c /dev/null tests/integration_tests/adapters/okx/test_algo_completeness.py tests/integration_tests/adapters/okx/test_spot_cash_position_reports.py tests/unit_tests/live/test_execution_order_checks.py tests/unit_tests/live/test_execution_engine.py --junitxml=/tmp/public-wheels/execution-tests.xml
           /tmp/qualification/bin/python -m pytest -q --rootdir=. -p no:cacheprovider -p pytest_asyncio.plugin -p pytest_mock -c /dev/null tests/integration_tests/adapters/okx/test_execution.py -k 'reconnect or capture_status' --junitxml=/tmp/public-wheels/recovery-tests.xml

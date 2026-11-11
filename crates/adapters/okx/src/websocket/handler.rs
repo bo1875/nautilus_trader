@@ -115,6 +115,7 @@ type PlaceRequestData = (
     TraderId,
     StrategyId,
     InstrumentId,
+    OKXRequestObservation,
 );
 
 /// Data cached for pending cancel requests to correlate with responses.
@@ -806,10 +807,20 @@ impl OKXWsFeedHandler {
             + self.pending_mass_cancel_requests.len();
         let ts_observed_ns = self.clock.get_time_ns().as_u64();
         let mut pending = Vec::with_capacity(pending_count.min(DETAIL_LIMIT));
-        for (_, (_, _, _, _, _, mut observation)) in self
+        for mut observation in self
             .pending_cancel_requests
             .drain()
-            .chain(self.pending_amend_requests.drain())
+            .map(|(_, pending)| pending.5)
+            .chain(
+                self.pending_amend_requests
+                    .drain()
+                    .map(|(_, pending)| pending.5),
+            )
+            .chain(
+                self.pending_place_requests
+                    .drain()
+                    .map(|(_, pending)| pending.5),
+            )
         {
             if pending.len() < DETAIL_LIMIT {
                 observation.ts_observed_ns = ts_observed_ns;
@@ -817,7 +828,6 @@ impl OKXWsFeedHandler {
                 pending.push(observation);
             }
         }
-        self.pending_place_requests.clear();
         self.pending_mass_cancel_requests.clear();
         self.connection_generation += 1;
         self.observations_emitted = 0;
@@ -975,8 +985,18 @@ impl OKXWsFeedHandler {
         let pending = self
             .pending_amend_requests
             .get_mut(request_id)
-            .or_else(|| self.pending_cancel_requests.get_mut(request_id));
-        if let Some((_, _, _, _, _, observation)) = pending {
+            .map(|pending| &mut pending.5)
+            .or_else(|| {
+                self.pending_cancel_requests
+                    .get_mut(request_id)
+                    .map(|pending| &mut pending.5)
+            })
+            .or_else(|| {
+                self.pending_place_requests
+                    .get_mut(request_id)
+                    .map(|pending| &mut pending.5)
+            });
+        if let Some(observation) = pending {
             let now = self.clock.get_time_ns().as_u64();
             observation.ts_send_completed_ns = Some(now);
             observation.ts_observed_ns = now;
@@ -1146,11 +1166,21 @@ impl OKXWsFeedHandler {
             .and_then(|id| {
                 self.pending_amend_requests
                     .get(id)
-                    .or_else(|| self.pending_cancel_requests.get(id))
+                    .map(|pending| &pending.5)
+                    .or_else(|| {
+                        self.pending_cancel_requests
+                            .get(id)
+                            .map(|pending| &pending.5)
+                    })
+                    .or_else(|| {
+                        self.pending_place_requests
+                            .get(id)
+                            .map(|pending| &pending.5)
+                    })
             })
-            .filter(|pending| pending.5.operation == op.to_string());
+            .filter(|observation| observation.operation == op.to_string());
         let mut observation = matched
-            .map(|pending| pending.5.clone())
+            .cloned()
             .unwrap_or_else(|| self.receive_observation(&op.to_string(), ts_init));
         // The frame request id is observable even when no retained operation matches.
         observation.request_id = id.clone().unwrap_or_default();
@@ -1159,13 +1189,34 @@ impl OKXWsFeedHandler {
         observation.outcome = "response_received".into();
         observation.response_code = Some(code.clone());
         let was_matched = matched.is_some();
+        let is_place =
+            was_matched && matches!(op, OKXWsOperation::Order | OKXWsOperation::OrderAlgo);
+        // Classify the observed reply independently of the existing order-event
+        // behavior. A matching request alone is not proof of acknowledgment.
+        let place_result =
+            is_place.then(|| Self::place_response_result(&observation, &code, &data));
         self.emit_request_observation(observation.clone());
         let result = self.handle_order_response_inner(id.clone(), op, code, msg, data, ts_init);
         let still_pending = id.as_deref().is_some_and(|id| {
             self.pending_amend_requests.contains_key(id)
                 || self.pending_cancel_requests.contains_key(id)
+                || self.pending_place_requests.contains_key(id)
         });
-        if !was_matched || still_pending {
+        if let Some(result) = place_result {
+            if let Some((effective_code, venue_id)) = result {
+                observation.outcome = if effective_code == "0" {
+                    "acknowledged"
+                } else {
+                    "rejected"
+                }
+                .into();
+                observation.response_code = Some(effective_code);
+                observation.venue_order_id = venue_id;
+            } else {
+                observation.outcome = "response_unresolved".into();
+            }
+            self.emit_request_observation(observation);
+        } else if !was_matched || still_pending {
             observation.outcome = if was_matched {
                 "response_unresolved"
             } else {
@@ -1176,6 +1227,49 @@ impl OKXWsFeedHandler {
             self.emit_request_observation(observation);
         }
         result
+    }
+
+    fn place_response_result(
+        observation: &OKXRequestObservation,
+        code: &str,
+        data: &[Value],
+    ) -> Option<(String, Option<String>)> {
+        let valid_code = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 16
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+        };
+        if !valid_code(code) {
+            return None;
+        }
+        if data.is_empty() && code != "0" {
+            return Some((code.into(), None));
+        }
+        if data.len() != 1 {
+            return None;
+        }
+        let item = &data[0];
+        if item.get("clOrdId").and_then(Value::as_str) != Some(observation.client_order_id.as_str())
+        {
+            return None;
+        }
+        let item_code = item.get("sCode").and_then(Value::as_str)?;
+        if !valid_code(item_code) || (code != "0" && item_code == "0") {
+            return None;
+        }
+        let venue_key = if observation.operation == OKXWsOperation::OrderAlgo.to_string() {
+            "algoId"
+        } else {
+            "ordId"
+        };
+        let venue = item
+            .get(venue_key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if item_code == "0" && venue.is_none() {
+            return None;
+        }
+        Some((item_code.into(), venue.map(str::to_owned)))
     }
 
     fn handle_order_response_inner(
@@ -1350,7 +1444,7 @@ impl OKXWsFeedHandler {
                 log::debug!("Mass cancel operation successful for instrument: {instrument_id}");
             } else if op == OKXWsOperation::Order
                 && let Some(request_id) = &id
-                && let Some((params, client_order_id, trader_id, strategy_id, instrument_id)) =
+                && let Some((params, client_order_id, trader_id, strategy_id, instrument_id, _)) =
                     self.pending_place_requests.remove(request_id)
             {
                 let (venue_order_id, ts_accepted) = if let Some(first) = data.first() {
@@ -1487,8 +1581,14 @@ impl OKXWsFeedHandler {
         if let Some(request_id) = &id {
             match op {
                 OKXWsOperation::Order => {
-                    if let Some((_params, client_order_id, trader_id, strategy_id, instrument_id)) =
-                        self.pending_place_requests.remove(request_id)
+                    if let Some((
+                        _params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        _,
+                    )) = self.pending_place_requests.remove(request_id)
                     {
                         let due_post_only = is_post_only_rejection(code.as_str(), &data);
                         let rejected = OrderRejected::new(
@@ -1509,8 +1609,14 @@ impl OKXWsFeedHandler {
                     }
                 }
                 OKXWsOperation::OrderAlgo => {
-                    if let Some((_params, client_order_id, trader_id, strategy_id, instrument_id)) =
-                        self.pending_place_requests.remove(request_id)
+                    if let Some((
+                        _params,
+                        client_order_id,
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        _,
+                    )) = self.pending_place_requests.remove(request_id)
                     {
                         let due_post_only = is_post_only_rejection(code.as_str(), &data);
                         let rejected = OrderRejected::new(
@@ -2719,6 +2825,16 @@ impl OKXWsFeedHandler {
     ) -> anyhow::Result<()> {
         let request_id = self.generate_unique_request_id();
 
+        let observation = self.request_observation(
+            &request_id,
+            OKXWsOperation::Order,
+            client_order_id,
+            instrument_id,
+            None,
+            params.px.clone(),
+            Some(params.sz.clone()),
+        );
+        self.emit_request_observation(observation.clone());
         self.pending_place_requests.insert(
             request_id.clone(),
             (
@@ -2727,6 +2843,7 @@ impl OKXWsFeedHandler {
                 trader_id,
                 strategy_id,
                 instrument_id,
+                observation,
             ),
         );
 
@@ -2745,13 +2862,20 @@ impl OKXWsFeedHandler {
             .await
         {
             Ok(()) => {
+                self.observe_send_completed(&request_id);
                 log::debug!("Sent place order request");
                 Ok(())
             }
             Err(e) => {
                 log::error!("Failed to send place order after retries: error={e}");
 
-                self.pending_place_requests.remove(&request_id);
+                if let Some((_, _, _, _, _, mut observation)) =
+                    self.pending_place_requests.remove(&request_id)
+                {
+                    observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+                    observation.outcome = "send_error_unknown".into();
+                    self.emit_request_observation(observation);
+                }
 
                 let ts_now = self.clock.get_time_ns();
                 let rejected = OrderRejected::new(
@@ -2784,6 +2908,16 @@ impl OKXWsFeedHandler {
     ) -> anyhow::Result<()> {
         let request_id = self.generate_unique_request_id();
 
+        let observation = self.request_observation(
+            &request_id,
+            OKXWsOperation::OrderAlgo,
+            client_order_id,
+            instrument_id,
+            None,
+            params.order_px.clone(),
+            Some(params.sz.clone()),
+        );
+        self.emit_request_observation(observation.clone());
         self.pending_place_requests.insert(
             request_id.clone(),
             (
@@ -2792,6 +2926,7 @@ impl OKXWsFeedHandler {
                 trader_id,
                 strategy_id,
                 instrument_id,
+                observation,
             ),
         );
 
@@ -2810,13 +2945,20 @@ impl OKXWsFeedHandler {
             .await
         {
             Ok(()) => {
+                self.observe_send_completed(&request_id);
                 log::debug!("Sent place algo order request");
                 Ok(())
             }
             Err(e) => {
                 log::error!("Failed to send place algo order after retries: error={e}");
 
-                self.pending_place_requests.remove(&request_id);
+                if let Some((_, _, _, _, _, mut observation)) =
+                    self.pending_place_requests.remove(&request_id)
+                {
+                    observation.ts_observed_ns = self.clock.get_time_ns().as_u64();
+                    observation.outcome = "send_error_unknown".into();
+                    self.emit_request_observation(observation);
+                }
 
                 let ts_now = self.clock.get_time_ns();
                 let rejected = OrderRejected::new(
@@ -3197,7 +3339,9 @@ mod tests {
     use nautilus_network::websocket::{AuthTracker, SubscriptionState};
     use rstest::rstest;
 
-    use super::{NautilusWsMessage, OKXWsFeedHandler, OKXWsOperation};
+    use super::{
+        NautilusWsMessage, OKXWsFeedHandler, OKXWsOperation, PendingOrderParams, WsPostOrderParams,
+    };
     use crate::websocket::parse::OrderStateSnapshot;
     use nautilus_core::UnixNanos;
 
@@ -3632,6 +3776,15 @@ mod tests {
                     context.1,
                     context.2,
                     context.3,
+                    handler.request_observation(
+                        "place-1",
+                        OKXWsOperation::Order,
+                        context.0,
+                        context.3,
+                        None,
+                        Some("100".into()),
+                        Some("1".into()),
+                    ),
                 ),
             );
             let placed = handler.handle_order_response(
@@ -3819,6 +3972,15 @@ mod tests {
                     context.1,
                     context.2,
                     context.3,
+                    handler.request_observation(
+                        "place-1",
+                        OKXWsOperation::Order,
+                        context.0,
+                        context.3,
+                        None,
+                        Some("100".into()),
+                        Some("1".into()),
+                    ),
                 ),
             );
             assert!(matches!(
@@ -4932,6 +5094,235 @@ assert consumer._ws_capture_status_failures == 0
         assert!(handler.pending_amend_requests.is_empty());
         assert!(handler.pending_cancel_requests.is_empty());
         assert!(handler.order_state_cache.is_empty());
+    }
+
+    fn insert_pending_place(handler: &mut OKXWsFeedHandler, request_id: &str) {
+        let params: WsPostOrderParams = serde_json::from_value(serde_json::json!({
+            "instId":"BTC-USDT-SWAP", "tdMode":"cross", "side":"buy",
+            "ordType":"limit", "sz":"2", "px":"100", "clOrdId":"TEST-ORDER"
+        }))
+        .unwrap();
+        handler.pending_place_requests.insert(
+            request_id.into(),
+            (
+                PendingOrderParams::Regular(params),
+                ClientOrderId::new("TEST-ORDER"),
+                TraderId::new("TRADER-001"),
+                StrategyId::new("STRATEGY-001"),
+                InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                handler.request_observation(
+                    request_id,
+                    OKXWsOperation::Order,
+                    ClientOrderId::new("TEST-ORDER"),
+                    InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                    None,
+                    Some("100".into()),
+                    Some("2".into()),
+                ),
+            ),
+        );
+    }
+
+    #[rstest]
+    fn test_place_observation_correlates_response_and_reconnect() {
+        let (mut handler, mut out, _, _) = create_test_handler();
+        insert_pending_place(&mut handler, "place-1");
+        handler.observe_send_completed("place-1");
+        handler.handle_order_response(
+            Some("place-1".into()),
+            OKXWsOperation::Order,
+            "0".into(),
+            String::new(),
+            vec![serde_json::json!({"clOrdId":"TEST-ORDER", "ordId":"12345", "sCode":"0"})],
+            UnixNanos::from(3_000u64),
+        );
+        let mut observations = Vec::new();
+        while let Ok(NautilusWsMessage::RequestObservation(row)) = out.try_recv() {
+            observations.push(row);
+        }
+        assert_eq!(
+            observations
+                .iter()
+                .map(|row| row.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["send_completed", "response_received", "acknowledged"]
+        );
+        for row in &observations {
+            assert_eq!(row.request_id, "place-1");
+            assert_eq!(row.client_order_id, "TEST-ORDER");
+            assert_eq!(row.instrument_id, "BTC-USDT-SWAP.OKX");
+            assert_eq!(row.operation, "Order");
+            assert_eq!(row.requested_price.as_deref(), Some("100"));
+            assert_eq!(row.requested_size.as_deref(), Some("2"));
+            assert!(row.ts_handler_ns > 0 && row.ts_send_completed_ns.is_some());
+        }
+        insert_pending_place(&mut handler, "place-2");
+        let reconnect = handler.drain_pending_requests_on_reconnect();
+        assert_eq!(reconnect.pending_count, 1);
+        assert_eq!(reconnect.omitted_count, 0);
+        assert_eq!(reconnect.pending[0].request_id, "place-2");
+        assert_eq!(reconnect.pending[0].outcome, "unresolved_on_reconnect");
+        assert_eq!(
+            reconnect.pending[0].connection_generation + 1,
+            reconnect.connection_generation
+        );
+        assert!(handler.pending_place_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_place_observation_records_entry_and_failed_send() {
+        let (mut handler, mut out, _, _) = create_test_handler();
+        insert_pending_place(&mut handler, "fixture");
+        let (params, client, trader, strategy, instrument, _) =
+            handler.pending_place_requests.remove("fixture").unwrap();
+        let PendingOrderParams::Regular(params) = params else {
+            panic!("regular fixture")
+        };
+        assert!(
+            handler
+                .handle_place_order(params, client, trader, strategy, instrument)
+                .await
+                .is_err()
+        );
+        let mut observations = Vec::new();
+        let mut rejections = 0;
+        while let Ok(message) = out.try_recv() {
+            match message {
+                NautilusWsMessage::RequestObservation(row) => observations.push(row),
+                NautilusWsMessage::OrderRejected(_) => rejections += 1,
+                _ => (),
+            }
+        }
+        assert_eq!(rejections, 1); // Existing order-event behavior is preserved.
+        assert_eq!(
+            observations
+                .iter()
+                .map(|row| row.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["handler_received", "send_error_unknown"]
+        );
+        assert_eq!(observations[0].request_id, observations[1].request_id);
+        assert!(observations[1].ts_send_completed_ns.is_none());
+        assert!(handler.pending_place_requests.is_empty());
+    }
+
+    #[rstest]
+    #[case("0", serde_json::json!([]), "response_unresolved")]
+    #[case("0", serde_json::json!([{"clOrdId":"TEST-ORDER","ordId":"12345"}]), "response_unresolved")]
+    #[case("0", serde_json::json!([{"clOrdId":"OTHER","ordId":"12345","sCode":"0"}]), "response_unresolved")]
+    #[case("0", serde_json::json!([{"clOrdId":"TEST-ORDER","sCode":"0"}]), "response_unresolved")]
+    #[case("1", serde_json::json!([{"clOrdId":"TEST-ORDER","ordId":"12345","sCode":"0"}]), "response_unresolved")]
+    #[case("0", serde_json::json!([{"clOrdId":"TEST-ORDER","sCode":"51000"}]), "rejected")]
+    #[case("51000", serde_json::json!([]), "rejected")]
+    fn test_place_observation_requires_definitive_reply(
+        #[case] code: &str,
+        #[case] data: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let (mut handler, mut out, _, _) = create_test_handler();
+        insert_pending_place(&mut handler, "place-1");
+        handler.handle_order_response(
+            Some("place-1".into()),
+            OKXWsOperation::Order,
+            code.into(),
+            String::new(),
+            data.as_array().unwrap().clone(),
+            UnixNanos::from(3_000u64),
+        );
+        let mut outcomes = Vec::new();
+        while let Ok(message) = out.try_recv() {
+            if let NautilusWsMessage::RequestObservation(row) = message {
+                assert_eq!(row.client_order_id, "TEST-ORDER");
+                assert_eq!(row.ts_received_ns, Some(3_000));
+                outcomes.push(row.outcome);
+            }
+        }
+        assert_eq!(outcomes, vec!["response_received", expected]);
+    }
+
+    #[rstest]
+    fn test_place_observation_does_not_join_wrong_operation_or_duplicate() {
+        let (mut handler, mut out, _, _) = create_test_handler();
+        insert_pending_place(&mut handler, "place-1");
+        let data = vec![serde_json::json!({"clOrdId":"TEST-ORDER","ordId":"12345","sCode":"0"})];
+        for op in [
+            OKXWsOperation::CancelOrder,
+            OKXWsOperation::Order,
+            OKXWsOperation::Order,
+        ] {
+            handler.handle_order_response(
+                Some("place-1".into()),
+                op,
+                "0".into(),
+                String::new(),
+                data.clone(),
+                UnixNanos::from(3_000u64),
+            );
+        }
+        let mut outcomes = Vec::new();
+        while let Ok(message) = out.try_recv() {
+            if let NautilusWsMessage::RequestObservation(row) = message {
+                outcomes.push(row.outcome);
+            }
+        }
+        assert_eq!(
+            outcomes,
+            vec![
+                "response_received",
+                "response_unmatched",
+                "response_received",
+                "acknowledged",
+                "response_received",
+                "response_unmatched"
+            ]
+        );
+        insert_pending_place(&mut handler, "new-request");
+        handler.handle_order_response(
+            Some("place-1".into()),
+            OKXWsOperation::Order,
+            "0".into(),
+            String::new(),
+            data,
+            UnixNanos::from(4_000u64),
+        );
+        assert!(handler.pending_place_requests.contains_key("new-request"));
+    }
+
+    #[rstest]
+    fn test_place_observation_algo_uses_algo_venue_identity() {
+        let (handler, _, _, _) = create_test_handler();
+        let observation = handler.request_observation(
+            "algo-1",
+            OKXWsOperation::OrderAlgo,
+            ClientOrderId::new("TEST-ORDER"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            None,
+            Some("100".into()),
+            Some("2".into()),
+        );
+        let data = vec![serde_json::json!({"clOrdId":"TEST-ORDER","algoId":"12345","sCode":"0"})];
+        assert_eq!(
+            OKXWsFeedHandler::place_response_result(&observation, "0", &data),
+            Some(("0".into(), Some("12345".into())))
+        );
+    }
+
+    #[rstest]
+    fn test_place_observation_reconnect_details_remain_bounded() {
+        let (mut handler, _, _, _) = create_test_handler();
+        for index in 0..129 {
+            insert_pending_place(&mut handler, &format!("request-{index}"));
+        }
+        let reconnect = handler.drain_pending_requests_on_reconnect();
+        assert_eq!(reconnect.pending_count, 129);
+        assert_eq!(reconnect.pending.len(), 128);
+        assert_eq!(reconnect.omitted_count, 1);
+        assert!(
+            reconnect
+                .pending
+                .iter()
+                .all(|row| row.outcome == "unresolved_on_reconnect")
+        );
     }
 
     fn insert_pending_amend(handler: &mut OKXWsFeedHandler, request_id: &str) {
