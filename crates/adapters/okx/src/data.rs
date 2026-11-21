@@ -253,9 +253,10 @@ impl OKXDataClient {
             NautilusWsMessage::Raw(value) => {
                 log::debug!("Unhandled websocket payload: {value:?}");
             }
-            NautilusWsMessage::Reconnected => {
+            NautilusWsMessage::Reconnected(_) => {
                 log::info!("Websocket reconnected");
             }
+            NautilusWsMessage::RequestObservation(_) => {}
             NautilusWsMessage::Authenticated => {
                 log::debug!("Websocket authenticated");
             }

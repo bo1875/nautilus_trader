@@ -13,6 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import asyncio
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -22,15 +24,22 @@ import pytest
 from nautilus_trader.adapters.okx.config import OKXExecClientConfig
 from nautilus_trader.adapters.okx.constants import OKX_VENUE
 from nautilus_trader.adapters.okx.execution import OKXExecutionClient
+from nautilus_trader.common.component import MessageBus
+from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import GenerateFillReports
+from nautilus_trader.execution.messages import GenerateOrderStatusReport
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.messages import GeneratePositionStatusReports
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.live.execution_engine import LiveExecutionEngine
+from nautilus_trader.live.reconciliation import IncompleteOrderStatusReports
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.events import OrderDenied
@@ -46,6 +55,7 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.orders import StopMarketOrder
+from nautilus_trader.test_kit.functions import eventually
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
@@ -160,7 +170,7 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     )
 
     pyo3_report = MagicMock()
-    http_client.request_order_status_reports.return_value = [pyo3_report]
+    http_client.request_order_status_reports_with_errors.return_value = ([pyo3_report], [])
 
     command = GenerateOrderStatusReports(
         instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
@@ -175,7 +185,7 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     reports = await client.generate_order_status_reports(command)
 
     # Assert
-    http_client.request_order_status_reports.assert_awaited_once()
+    http_client.request_order_status_reports_with_errors.assert_awaited_once()
     assert reports == [expected_report]
 
 
@@ -183,7 +193,10 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
 async def test_generate_order_status_reports_handles_failure(exec_client_builder, monkeypatch):
     # Arrange
     client, _, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_order_status_reports.side_effect = Exception("boom")
+    http_client.request_order_status_reports.side_effect = TimeoutError("Synthetic read timeout")
+    http_client.request_order_status_reports_with_errors = AsyncMock(
+        side_effect=TimeoutError("Synthetic read timeout"),
+    )
 
     command = GenerateOrderStatusReports(
         instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
@@ -194,11 +207,9 @@ async def test_generate_order_status_reports_handles_failure(exec_client_builder
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_order_status_reports(command)
-
-    # Assert
-    assert reports == []
+    with pytest.raises(IncompleteOrderStatusReports) as exc:
+        await client.generate_order_status_reports(command)
+    assert exc.value.reports == []
 
 
 @pytest.mark.asyncio
@@ -212,7 +223,7 @@ async def test_generate_fill_reports_converts_results(exec_client_builder, monke
         lambda obj: expected_report,
     )
 
-    http_client.request_fill_reports.return_value = [MagicMock()]
+    http_client.request_fill_reports_with_errors.return_value = ([MagicMock()], [])
 
     command = GenerateFillReports(
         instrument_id=InstrumentId(Symbol("BTC-USD"), OKX_VENUE),
@@ -227,7 +238,7 @@ async def test_generate_fill_reports_converts_results(exec_client_builder, monke
     reports = await client.generate_fill_reports(command)
 
     # Assert
-    http_client.request_fill_reports.assert_awaited_once()
+    http_client.request_fill_reports_with_errors.assert_awaited_once()
     assert reports == [expected_report]
 
 
@@ -246,7 +257,7 @@ async def test_generate_position_status_reports_converts_results(exec_client_bui
         lambda obj: expected_report,
     )
 
-    http_client.request_position_status_reports.return_value = [MagicMock()]
+    http_client.request_position_status_reports_with_errors.return_value = ([MagicMock()], [])
 
     command = GeneratePositionStatusReports(
         instrument_id=None,
@@ -260,7 +271,7 @@ async def test_generate_position_status_reports_converts_results(exec_client_bui
     reports = await client.generate_position_status_reports(command)
 
     # Assert
-    http_client.request_position_status_reports.assert_awaited_once()
+    http_client.request_position_status_reports_with_errors.assert_awaited_once()
     assert reports == [expected_report]
 
 
@@ -288,7 +299,7 @@ async def test_generate_position_status_reports_spot_margin_uses_margin_inst_typ
         lambda obj: expected_report,
     )
 
-    http_client.request_position_status_reports.return_value = [MagicMock()]
+    http_client.request_position_status_reports_with_errors.return_value = ([MagicMock()], [])
 
     command = GeneratePositionStatusReports(
         instrument_id=instrument.id,
@@ -302,8 +313,8 @@ async def test_generate_position_status_reports_spot_margin_uses_margin_inst_typ
     reports = await client.generate_position_status_reports(command)
 
     # Assert - verify MARGIN instType is used for spot margin positions
-    http_client.request_position_status_reports.assert_awaited_once()
-    call_args = http_client.request_position_status_reports.call_args
+    http_client.request_position_status_reports_with_errors.assert_awaited_once()
+    call_args = http_client.request_position_status_reports_with_errors.call_args
     assert call_args.kwargs["instrument_type"] == nautilus_pyo3.OKXInstrumentType.MARGIN
     assert reports == [expected_report]
 
@@ -375,8 +386,11 @@ async def test_handle_fill_report_updates_venue_id_before_fill(exec_client_build
 @pytest.mark.asyncio
 async def test_generate_position_status_reports_handles_failure(exec_client_builder, monkeypatch):
     # Arrange
-    client, _, _, http_client, _ = exec_client_builder(monkeypatch)
-    http_client.request_position_status_reports.side_effect = Exception("boom")
+    client, _, _, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"instrument_types": (nautilus_pyo3.OKXInstrumentType.SWAP,)},
+    )
+    http_client.request_position_status_reports_with_errors.side_effect = Exception("boom")
 
     command = GeneratePositionStatusReports(
         instrument_id=None,
@@ -386,11 +400,8 @@ async def test_generate_position_status_reports_handles_failure(exec_client_buil
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
-
-    # Assert
-    assert reports == []
+    with pytest.raises(Exception, match="boom"):
+        await client.generate_position_status_reports(command)
 
 
 @pytest.mark.asyncio
@@ -895,9 +906,11 @@ async def test_cancel_all_orders_handles_mixed_regular_and_algo_orders(
     assert http_client.cancel_algo_order.call_count == 2
 
 
-# =====================================================================================
+# ==============================================================================
+
 # Quote Quantity Order Tests
-# =====================================================================================
+# ==============================================================================
+
 
 
 @pytest.mark.asyncio
@@ -1772,3 +1785,959 @@ async def test_batch_cancel_orders_only_algo_orders(exec_client_builder, monkeyp
     http_client.cancel_algo_orders.assert_awaited_once()
     http_call_args = http_client.cancel_algo_orders.call_args[0][0]
     assert len(http_call_args) == 2  # Both algo orders
+
+
+def _order_report(order, account_id, status=OrderStatus.ACCEPTED):
+    return OrderStatusReport(
+        account_id=account_id,
+        instrument_id=order.instrument_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("1"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=status,
+        price=order.price,
+        quantity=order.quantity,
+        filled_qty=Quantity.zero(order.quantity.precision),
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "row", "conversion", "cancel"])
+async def test_targeted_query_failure_is_not_absence(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    failure,
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=VenueOrderId("1"),
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    if failure in ("transport", "cancel"):
+        error = TimeoutError() if failure == "transport" else asyncio.CancelledError()
+        http.request_order_status_reports.side_effect = error
+        http.request_order_status_reports_with_errors.side_effect = error
+    elif failure == "row":
+        http.request_order_status_reports_with_errors.return_value = ([], ["row:conversion"])
+    else:
+        http.request_order_status_reports.return_value = [object()]
+        http.request_order_status_reports_with_errors.return_value = ([object()], [])
+
+    expected = asyncio.CancelledError if failure == "cancel" else IncompleteOrderStatusReports
+    with pytest.raises(expected):
+        await client.generate_order_status_report(command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "row", "conversion"])
+async def test_periodic_okx_incomplete_query_keeps_positive_reports(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    event_loop,
+    msgbus,
+    cache,
+    live_clock,
+    failure,
+):
+    client, _, _, http, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "instrument_types": (
+                nautilus_pyo3.OKXInstrumentType.SPOT,
+                nautilus_pyo3.OKXInstrumentType.SWAP,
+            ),
+        },
+    )
+    engine = LiveExecutionEngine(
+        loop=event_loop,
+        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
+        cache=cache,
+        clock=live_clock,
+        config=LiveExecEngineConfig(open_check_open_only=False, open_check_threshold_ms=0),
+    )
+    engine.register_client(client)
+    cache.add_instrument(instrument)
+    orders = [
+        TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId(f"O-{i}"))
+        for i in (1, 2)
+    ]
+    for order in orders:
+        cache.add_order(order, client_id=client.id)
+        order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id))
+        order.apply(TestEventStubs.order_accepted(order, account_id=client.account_id))
+        cache.update_order(order)
+    positive = _order_report(orders[0], client.account_id, OrderStatus.CANCELED).to_pyo3()
+    if failure == "transport":
+        http.request_order_status_reports_with_errors.side_effect = [
+            ([positive], []),
+            TimeoutError(),
+        ]
+    elif failure == "row":
+        http.request_order_status_reports_with_errors.side_effect = [
+            ([positive], ["row:conversion"]),
+            ([], []),
+        ]
+    else:
+        http.request_order_status_reports_with_errors.side_effect = [
+            ([object(), positive], []),
+            ([], []),
+        ]
+
+    try:
+        await engine._check_orders_consistency()
+        assert orders[0].status == OrderStatus.CANCELED
+        assert orders[1].status == OrderStatus.ACCEPTED
+        assert orders[1].client_order_id not in engine._recon_check_retries
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [False, True])
+async def test_targeted_incomplete_query_can_return_a_positive_match(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    matches,
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    order = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-1"))
+    report = _order_report(order, client.account_id).to_pyo3()
+    http.request_order_status_reports_with_errors.return_value = ([report], ["row:conversion"])
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=order.client_order_id if matches else ClientOrderId("O-2"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    if matches:
+        result = await client.generate_order_status_report(command)
+        assert result.client_order_id == order.client_order_id
+    else:
+        with pytest.raises(IncompleteOrderStatusReports) as exc:
+            await client.generate_order_status_report(command)
+        assert [r.client_order_id for r in exc.value.reports] == [order.client_order_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_targeted_algo_fallback_preserves_failure(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    failure,
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    other = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-2"))
+    http.request_order_status_reports_with_errors.return_value = (
+        [_order_report(other, client.account_id).to_pyo3()],
+        [],
+    )
+    http.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
+    if failure:
+        http.request_algo_order_status_reports_with_errors.side_effect = TimeoutError(
+            "Synthetic read timeout"
+        )
+    command = GenerateOrderStatusReport(
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-1"),
+        venue_order_id=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    if failure:
+        with pytest.raises(TimeoutError):
+            await client.generate_order_status_report(command)
+    else:
+        assert await client.generate_order_status_report(command) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader", ["orders", "fills", "positions", "margin", "wallet"])
+@pytest.mark.parametrize("failure", ["transport", "conversion", "cancel", "row", "empty"])
+async def test_mass_status_requires_every_reader_to_complete(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    reader,
+    failure,
+):
+    is_wallet = reader == "wallet"
+    client, _, _, http, provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "instrument_types": (
+                nautilus_pyo3.OKXInstrumentType.SPOT
+                if reader in ("wallet", "margin")
+                else nautilus_pyo3.OKXInstrumentType.SWAP,
+            ),
+            "use_spot_margin": reader == "margin",
+            "use_spot_cash_position_reports": is_wallet,
+        },
+    )
+    provider.get_all.return_value = {instrument.id: instrument}
+    for name in ("order_status", "fill", "position_status"):
+        setattr(http, f"request_{name}_reports_with_errors", AsyncMock(return_value=([], [])))
+    http.get_balance = AsyncMock(return_value=[])
+    method = {
+        "orders": "request_order_status_reports",
+        "fills": "request_fill_reports",
+        "positions": "request_position_status_reports",
+        "margin": "request_position_status_reports",
+        "wallet": "get_balance",
+    }[reader]
+    legacy = getattr(http, method)
+    strict = legacy if is_wallet else getattr(http, method + "_with_errors")
+    if failure in ("transport", "cancel"):
+        error = (
+            TimeoutError("Synthetic read timeout")
+            if failure == "transport"
+            else asyncio.CancelledError()
+        )
+        legacy.side_effect = strict.side_effect = error
+    elif failure == "conversion":
+        legacy.return_value = [object()]
+        strict.return_value = [object()] if is_wallet else ([object()], [])
+    elif failure == "row":
+        if is_wallet:
+            http.get_balance.return_value = [SimpleNamespace(ccy="BTC", cash_bal="NaN", liab="0")]
+        else:
+            strict.return_value = ([], ["row:conversion"])
+
+    if failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await client.generate_mass_status()
+    elif failure == "empty":
+        assert await client.generate_mass_status() is not None
+    else:
+        assert await client.generate_mass_status() is None
+
+
+@pytest.mark.asyncio
+async def test_mass_status_wallet_quantity_failure_is_not_flat(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    client, _, _, http, provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "use_spot_margin": False,
+            "use_spot_cash_position_reports": True,
+        },
+    )
+    provider.get_all.return_value = {instrument.id: instrument}
+    http.request_fill_reports_with_errors = AsyncMock(return_value=([], []))
+    http.get_balance = AsyncMock(
+        return_value=[SimpleNamespace(ccy="BTC", cash_bal="1e100", liab="0")]
+    )
+    assert await client.generate_mass_status() is None
+
+
+@pytest.mark.asyncio
+async def test_overlapping_mass_status_success_cannot_certify_failure(
+    exec_client_builder, monkeypatch
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fills(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            raise TimeoutError("Synthetic read timeout")
+        return [], []
+
+    http.request_fill_reports_with_errors.side_effect = fills
+    failed = asyncio.create_task(client.generate_mass_status())
+    await started.wait()
+    try:
+        complete = await client.generate_mass_status()
+        assert complete is not None
+        assert not failed.done()
+    finally:
+        release.set()
+    assert await failed is None
+    assert await client.generate_mass_status() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("balance", ["0", "0.00000001"])
+async def test_wallet_qualified_zero_remains_flat(
+    exec_client_builder, monkeypatch, instrument, balance
+):
+    client, _, _, http, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "use_spot_margin": False,
+            "use_spot_cash_position_reports": True,
+        },
+    )
+    http.get_balance = AsyncMock(
+        return_value=[SimpleNamespace(ccy="BTC", cash_bal=balance, liab="0")]
+    )
+    command = GeneratePositionStatusReports(
+        instrument_id=instrument.id,
+        start=None,
+        end=None,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    reports = await client.generate_position_status_reports(command)
+    assert len(reports) == 1
+    assert reports[0].quantity == Quantity.zero(instrument.size_precision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("regular_rows", ["empty", "unrelated"])
+@pytest.mark.parametrize("outcome", ["client_match", "algo_match", "error", "absent"])
+async def test_known_algo_resolution_does_not_depend_on_regular_orders(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+    cache,
+    live_clock,
+    caller,
+    regular_rows,
+    outcome,
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    order = StopMarketOrder(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        client_order_id=ClientOrderId("O-ALGO"),
+        order_side=OrderSide.SELL,
+        quantity=instrument.make_qty(1),
+        trigger_price=instrument.make_price(100),
+        trigger_type=TriggerType.LAST_PRICE,
+        init_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+    cache.add_order(order, client_id=client.id)
+    order.apply(TestEventStubs.order_submitted(order, account_id=client.account_id, ts_event=0))
+    if caller == "periodic":
+        order.apply(TestEventStubs.order_accepted(order, account_id=client.account_id, ts_event=0))
+    cache.update_order(order)
+    before = list(order.events)
+    client._algo_order_ids[order.client_order_id] = "9001"
+    report = OrderStatusReport(
+        account_id=client.account_id,
+        instrument_id=instrument.id,
+        client_order_id=order.client_order_id,
+        venue_order_id=VenueOrderId("9001"),
+        order_side=order.side,
+        order_type=order.order_type,
+        time_in_force=order.time_in_force,
+        order_status=OrderStatus.ACCEPTED,
+        quantity=order.quantity,
+        filled_qty=Quantity.zero(instrument.size_precision),
+        trigger_price=order.trigger_price,
+        trigger_type=TriggerType.LAST_PRICE,
+        report_id=TestIdStubs.uuid(),
+        ts_accepted=0,
+        ts_last=0,
+        ts_init=0,
+    )
+    rows = []
+    if regular_rows == "unrelated":
+        other = TestExecStubs.limit_order(
+            instrument=instrument, client_order_id=ClientOrderId("O-OTHER")
+        )
+        other_report = _order_report(other, client.account_id)
+        other_report.venue_order_id = VenueOrderId("9002")
+        rows = [other_report.to_pyo3()]
+    http.request_order_status_reports_with_errors.return_value = (rows, [])
+
+    async def algo_read(**kwargs):
+        if outcome == "error":
+            raise TimeoutError("Synthetic algo read failure")
+        matched = (outcome == "client_match" and kwargs["algo_client_order_id"] is not None) or (
+            outcome == "algo_match" and kwargs["algo_id"] == "9001"
+        )
+        return ([report.to_pyo3()] if matched else [], [])
+
+    http.request_algo_order_status_reports_with_errors = AsyncMock(side_effect=algo_read)
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(),
+        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
+        cache=cache,
+        clock=live_clock,
+        config=LiveExecEngineConfig(
+            open_check_open_only=False, open_check_threshold_ms=0, single_order_query_delay_ms=0
+        ),
+    )
+    engine.register_client(client)
+    engine._recon_check_retries[order.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    try:
+        if caller == "periodic":
+            await engine._check_orders_consistency()
+        else:
+            await engine._check_inflight_orders()
+        if outcome == "absent":
+            assert order.status == OrderStatus.REJECTED
+        elif outcome == "error":
+            assert order.events == before
+        else:
+            assert order.status == OrderStatus.ACCEPTED
+        http.request_algo_order_status_reports_with_errors.assert_awaited()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["periodic", "inflight"])
+@pytest.mark.parametrize("positive_route", ["targeted_incomplete", "bulk_incomplete"])
+async def test_retained_positive_on_other_targeted_query(
+    exec_client_builder, monkeypatch, instrument, cache, live_clock, caller, positive_route
+):
+    client, _, _, http, _ = exec_client_builder(monkeypatch)
+    cache.add_instrument(instrument)
+    engine = LiveExecutionEngine(
+        loop=asyncio.get_running_loop(),
+        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=live_clock),
+        cache=cache,
+        clock=live_clock,
+        config=LiveExecEngineConfig(
+            open_check_open_only=False, open_check_threshold_ms=0, single_order_query_delay_ms=0
+        ),
+    )
+    engine.register_client(client)
+    b = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-B"))
+    cache.add_order(b, client_id=client.id)
+    b.apply(TestEventStubs.order_submitted(b, account_id=client.account_id, ts_event=0))
+    if caller == "periodic":
+        b.apply(
+            TestEventStubs.order_accepted(
+                b, account_id=client.account_id, venue_order_id=VenueOrderId("B"), ts_event=0
+            )
+        )
+    cache.update_order(b)
+    engine._recon_check_retries[b.client_order_id] = (
+        engine.open_check_missing_retries
+        if caller == "periodic"
+        else engine.inflight_check_max_retries
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def read(**kwargs):
+        nonlocal calls
+        calls += 1
+        # Initial periodic bulk pass has no positive observation.
+        if caller == "periodic" and calls == 1:
+            return [], []
+        entered.set()
+        await release.wait()
+        return [], []
+
+    http.request_order_status_reports_with_errors.side_effect = read
+    http.request_algo_order_status_reports_with_errors = AsyncMock(return_value=([], []))
+    task = asyncio.create_task(
+        engine._check_orders_consistency()
+        if caller == "periodic"
+        else engine._check_inflight_orders()
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    a = TestExecStubs.limit_order(instrument=instrument, client_order_id=ClientOrderId("O-A"))
+    cache.add_order(a, client_id=client.id)
+    a.apply(TestEventStubs.order_submitted(a, account_id=client.account_id, ts_event=0))
+    a.apply(
+        TestEventStubs.order_accepted(
+            a, account_id=client.account_id, venue_order_id=VenueOrderId("A"), ts_event=0
+        )
+    )
+    cache.update_order(a)
+    positive = _order_report(b, client.account_id)
+    positive.venue_order_id = VenueOrderId("B")
+    http.request_order_status_reports_with_errors.side_effect = None
+    http.request_order_status_reports_with_errors.return_value = (
+        [positive.to_pyo3()],
+        ["synthetic unrelated row conversion failure"],
+    )
+    try:
+        if positive_route == "targeted_incomplete":
+            # Actual engine caller receives IncompleteOrderStatusReports([positive B])
+            # from actual OKX targeted lookup of A.
+            await engine._resolve_order_not_found_at_venue(a)
+        else:
+            await engine._check_orders_consistency()
+        assert not a.is_closed
+    finally:
+        release.set()
+        await task
+        engine.dispose()
+    assert not engine._pending_absence_queries
+    assert not b.is_closed, (
+        "Retained positive B received during its older query must invalidate that absence decision"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_schedules_full_recovery_without_pending_entries(
+    exec_client_builder,
+    monkeypatch,
+    msgbus,
+):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    report = object()
+    recover = AsyncMock(return_value=report)
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    received = []
+    msgbus.register("ExecEngine.reconcile_execution_mass_status", received.append)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client._handle_ws_reconnect(event)
+    await client._ws_recovery_task
+    recover.assert_awaited_once_with()
+    assert received == [report]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_failed_recovery_retains_uncertainty(exec_client_builder, monkeypatch):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    recover = AsyncMock(side_effect=RuntimeError("synthetic read failure"))
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    event = SimpleNamespace(pending_count=200, omitted_count=72)
+    client._handle_ws_reconnect(event)
+    await client._ws_recovery_task
+    recover.assert_awaited_once_with()
+    assert client._ws_recovery_required
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_readback_schedules_followup(exec_client_builder, monkeypatch):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def readback():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+        return object()
+
+    monkeypatch.setattr(client, "generate_mass_status", readback)
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", lambda report: None)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client._handle_ws_reconnect(event)
+    await started.wait()
+    task = client._ws_recovery_task
+    client._handle_ws_reconnect(event)
+    assert client._ws_recovery_task is task
+    release.set()
+    await task
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reconnect_actual_mass_read_failure_sends_no_report(exec_client_builder, monkeypatch):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    monkeypatch.setattr(
+        client,
+        "generate_order_status_reports",
+        AsyncMock(side_effect=RuntimeError("synthetic failure")),
+    )
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    received = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", received.append)
+    client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
+    await client._ws_recovery_task
+    assert client._ws_recovery_required
+    assert not received
+
+
+@pytest.mark.asyncio
+async def test_reconnect_without_strict_collector_keeps_recovery_required(
+    exec_client_builder, monkeypatch
+):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    monkeypatch.setattr(client, "_mass_status_reports_complete", False)
+    recover = AsyncMock()
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
+    assert client._ws_recovery_required
+    assert client._ws_recovery_task is None
+    recover.assert_not_awaited()
+
+
+async def _connect_recovery_client(client, monkeypatch):
+    monkeypatch.setattr(client, "_await_account_registered", AsyncMock())
+    client.connect()
+    await eventually(lambda: client.is_connected)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_and_after_public_disconnect_starts_no_read(
+    exec_client_builder,
+    monkeypatch,
+):
+    client, private_ws, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+
+    async def close():
+        close_started.set()
+        await close_release.wait()
+
+    private_ws.close.side_effect = close
+    reads = AsyncMock(return_value=[])
+    monkeypatch.setattr(client, "generate_order_status_reports", reads)
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    reports = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", reports.append)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client.disconnect()
+    try:
+        # Includes the turn before the scheduled disconnect coroutine runs.
+        client._handle_ws_reconnect(event)
+        await close_started.wait()
+        client._handle_ws_reconnect(event)
+        await asyncio.sleep(0)
+        reads.assert_not_awaited()
+        assert not reports
+        assert client._ws_recovery_required
+    finally:
+        close_release.set()
+        await eventually(lambda: not client.is_connected)
+    client._handle_ws_reconnect(event)
+    await asyncio.sleep(0)
+    reads.assert_not_awaited()
+    assert not reports
+    assert client._ws_recovery_required
+
+
+@pytest.mark.asyncio
+async def test_reconnect_read_ignoring_cancellation_cannot_submit_after_disconnect(
+    exec_client_builder,
+    monkeypatch,
+):
+    client, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    client._mass_status_reports_complete = True
+    started = asyncio.Event()
+    collect = client.generate_mass_status
+
+    async def read():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return await collect()
+
+    monkeypatch.setattr(client, "generate_mass_status", read)
+    monkeypatch.setattr(client, "generate_order_status_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    reports = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", reports.append)
+    client._handle_ws_reconnect(SimpleNamespace(pending_count=0, omitted_count=0))
+    await asyncio.wait_for(started.wait(), 2)
+    client.disconnect()
+    await eventually(lambda: not client.is_connected)
+    assert not reports
+    assert client._ws_recovery_required
+
+
+@pytest.mark.asyncio
+async def test_reconnect_new_lifecycle_rejects_old_callback_and_recovers(
+    exec_client_builder,
+    monkeypatch,
+):
+    client, private_ws, *_ = exec_client_builder(monkeypatch)
+    await _connect_recovery_client(client, monkeypatch)
+    old_callback = private_ws.connect.call_args.kwargs["callback"]
+    client._mass_status_reports_complete = True
+    reads = AsyncMock(return_value=[])
+    monkeypatch.setattr(client, "generate_order_status_reports", reads)
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(nautilus_pyo3, "OKXWebSocketReconnect", SimpleNamespace)
+    reports = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", reports.append)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client.disconnect()
+    await eventually(lambda: not client.is_connected)
+    old_callback(event)
+    await asyncio.sleep(0)
+    reads.assert_not_awaited()
+    assert client._ws_recovery_required
+    await _connect_recovery_client(client, monkeypatch)
+    new_callback = private_ws.connect.call_args.kwargs["callback"]
+    try:
+        old_callback(event)
+        await asyncio.sleep(0)
+        reads.assert_not_awaited()
+        new_callback(event)
+        await client._ws_recovery_task
+        reads.assert_awaited_once()
+        assert len(reports) == 1
+        assert not client._ws_recovery_required
+    finally:
+        client.disconnect()
+        await eventually(lambda: not client.is_connected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("synthetic connect failure"), asyncio.CancelledError()]
+)
+async def test_reconnect_failed_connect_keeps_admission_closed(
+    exec_client_builder,
+    monkeypatch,
+    failure,
+):
+    client, private_ws, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    monkeypatch.setattr(client, "_await_account_registered", AsyncMock())
+    private_ws.wait_until_active.side_effect = failure
+    recover = AsyncMock()
+    monkeypatch.setattr(client, "generate_mass_status", recover)
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client._handle_ws_reconnect(event)
+    recover.assert_not_awaited()
+    with pytest.raises(type(failure)):
+        await client._connect()
+    client._handle_ws_reconnect(event)
+    await asyncio.sleep(0)
+    recover.assert_not_awaited()
+    assert client._ws_recovery_required
+
+
+def _track_delayed_collection(client, release_read, canceled, collected, suppress_cancellation):
+    collect = client.generate_mass_status
+
+    async def tracked_collection():
+        lifecycle = client._ws_recovery_lifecycle
+        try:
+            report = await collect()
+        except asyncio.CancelledError:
+            canceled.set()
+            if not suppress_cancellation:
+                raise
+            while not release_read.is_set():
+                with suppress(asyncio.CancelledError):
+                    await release_read.wait()
+            report = await collect()
+        collected.append((lifecycle, report))
+        return report
+
+    return tracked_collection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_failure", ["error", "cancel"])
+@pytest.mark.parametrize(
+    "retire",
+    ["before_retry", "after_retry", "cancel_suppressed", "disconnect_retry", "no_new_reconnect"],
+)
+async def test_reconnect_retry_after_failed_startup_has_one_current_recovery(
+    exec_client_builder,
+    monkeypatch,
+    startup_failure,
+    retire,
+):
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    client._mass_status_reports_complete = True
+    monkeypatch.setattr(client, "_await_account_registered", AsyncMock())
+    monkeypatch.setattr(nautilus_pyo3, "OKXWebSocketReconnect", SimpleNamespace)
+    startup = asyncio.Event()
+    fail_startup = asyncio.Event()
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    canceled = asyncio.Event()
+    reads = []
+    collected = []
+    reports = []
+    client._msgbus.register("ExecEngine.reconcile_execution_mass_status", reports.append)
+
+    async def wait_for_business(**kwargs):
+        startup.set()
+        await fail_startup.wait()
+        raise RuntimeError("synthetic business startup failure")
+
+    async def orders(command):
+        reads.append(client._ws_recovery_lifecycle)
+        if len(reads) == 1:
+            read_started.set()
+            await release_read.wait()
+        return []
+
+    tracked_collection = _track_delayed_collection(
+        client,
+        release_read,
+        canceled,
+        collected,
+        suppress_cancellation=retire in ("cancel_suppressed", "disconnect_retry"),
+    )
+
+    business_ws.wait_until_active.side_effect = wait_for_business
+    monkeypatch.setattr(client, "generate_mass_status", tracked_collection)
+    monkeypatch.setattr(client, "generate_order_status_reports", orders)
+    monkeypatch.setattr(client, "generate_fill_reports", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "generate_position_status_reports", AsyncMock(return_value=[]))
+    event = SimpleNamespace(pending_count=0, omitted_count=0)
+    client.connect()
+    await asyncio.wait_for(startup.wait(), 2)
+    old_callback = private_ws.connect.call_args.kwargs["callback"]
+    old_callback(event)
+    await asyncio.wait_for(read_started.wait(), 2)
+    old_task = client._ws_recovery_task
+    old_lifecycle = client._ws_recovery_lifecycle
+    if startup_failure == "cancel":
+        next(t for t in client._tasks if t.get_name() == "_connect" and not t.done()).cancel()
+    else:
+        fail_startup.set()
+    await eventually(lambda: client._ws_recovery_lifecycle is None)
+    assert not client.is_connected
+    if retire == "before_retry":
+        release_read.set()
+        await old_task
+    business_ws.wait_until_active.side_effect = None
+    await _connect_recovery_client(client, monkeypatch)
+    current_lifecycle = client._ws_recovery_lifecycle
+    current_callback = private_ws.connect.call_args.kwargs["callback"]
+    if retire != "no_new_reconnect":
+        current_callback(event)
+    if retire == "cancel_suppressed":
+        old_task.cancel()
+        await asyncio.wait_for(canceled.wait(), 2)
+    if retire == "disconnect_retry":
+        client.disconnect()
+        await asyncio.wait_for(canceled.wait(), 2)
+    release_read.set()
+    await eventually(lambda: client._ws_recovery_task.done())
+    if retire == "no_new_reconnect":
+        assert not reports
+        assert client._ws_recovery_required
+        current_callback(event)
+        await client._ws_recovery_task
+    try:
+        assert all(report is not None for _, report in collected)
+        old_reports = [report for owner, report in collected if owner is old_lifecycle]
+        current_reports = [report for owner, report in collected if owner is current_lifecycle]
+        assert len(old_reports) == 1
+        assert all(report not in reports for report in old_reports)
+        assert len(current_reports) == int(retire != "disconnect_retry")
+        assert reports == current_reports
+        assert client._ws_recovery_required == (retire == "disconnect_retry")
+    finally:
+        client.disconnect()
+        await eventually(lambda: not client.is_connected)
+
+
+@pytest.mark.asyncio
+async def test_capture_status_client_lifecycle_coalesces_and_contains_failure(
+    exec_client_builder, monkeypatch
+):
+    from nautilus_trader.live.execution_engine import ExecutionCaptureStatus
+
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    rows = []
+    sequence = [0]
+
+    def status(scope, closed=False):
+        sequence[0] += 1
+        return ExecutionCaptureStatus(
+            1,
+            "okx_transport",
+            scope,
+            0,
+            100 + sequence[0],
+            100,
+            60_000_000_000,
+            4096,
+            4096,
+            4096,
+            2,
+            sequence[0],
+            "closed" if closed else "exhausted",
+        )
+
+    private_ws.capture_status = lambda: status("private")
+    business_ws.capture_status = lambda: status("business")
+    client._handle_ws_capture_status = rows.append
+    client._start_ws_capture_status()
+    assert len(rows) == 2
+    old = client._ws_capture_status_handle
+    client._start_ws_capture_status()
+    assert old.cancelled()
+    assert len(rows) == 4
+
+    def fail(_):
+        raise RuntimeError("synthetic diagnostic consumer failure")
+
+    client._handle_ws_capture_status = fail
+    client._ws_capture_status_handle.cancel()
+    client._ws_capture_status_tick()
+    assert client._ws_capture_status_failures == 2
+    assert client._ws_capture_status_handle is not None
+    client._handle_ws_capture_status = rows.append
+    final_private = status("private", True)
+    final_business = status("business", True)
+    private_ws.capture_status = lambda: final_private
+    business_ws.capture_status = lambda: final_business
+    old = client._ws_capture_status_handle
+    await client._disconnect()
+    assert old.cancelled()
+    assert client._ws_capture_status_handle is None
+    assert rows[-2:] == [final_private, final_business]
+    count = len(rows)
+    client._offer_ws_capture_status(closed_only=True)
+    client._ws_capture_status_tick()
+    assert len(rows) == count
+    assert client._ws_capture_status_handle is None
+
+
+@pytest.mark.asyncio
+async def test_capture_status_legacy_extension_and_disconnect_failure(
+    exec_client_builder, monkeypatch
+):
+    client, private_ws, business_ws, *_ = exec_client_builder(monkeypatch)
+    private_ws.capture_status = None
+    business_ws.capture_status = None
+    client._start_ws_capture_status()
+    assert client._ws_capture_status_failures == 0
+    handle = client._ws_capture_status_handle
+    private_ws.is_closed.return_value = False
+    private_ws.close.side_effect = RuntimeError("synthetic close failure")
+    with pytest.raises(RuntimeError, match="synthetic close failure"):
+        await client._disconnect()
+    assert handle.cancelled()
+    assert client._ws_capture_status_handle is None

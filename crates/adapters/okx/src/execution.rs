@@ -1522,9 +1522,10 @@ pub fn dispatch_ws_message(
                 e.conn_id
             );
         }
-        NautilusWsMessage::Reconnected => {
+        NautilusWsMessage::Reconnected(_) => {
             log::info!("Websocket reconnected");
         }
+        NautilusWsMessage::RequestObservation(_) => {}
         NautilusWsMessage::Authenticated => {
             log::debug!("Websocket authenticated");
         }

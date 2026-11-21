@@ -443,6 +443,44 @@ impl OKXHttpClient {
         })
     }
 
+    #[pyo3(name = "request_algo_order_status_reports_with_errors")]
+    #[pyo3(signature = (account_id, instrument_type=None, instrument_id=None, algo_id=None, algo_client_order_id=None, state=None, limit=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_request_algo_order_status_reports_with_errors<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+        instrument_type: Option<OKXInstrumentType>,
+        instrument_id: Option<InstrumentId>,
+        algo_id: Option<String>,
+        algo_client_order_id: Option<ClientOrderId>,
+        state: Option<OKXOrderStatus>,
+        limit: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (reports, errors) = client
+                .request_algo_order_status_reports_with_errors(
+                    account_id,
+                    instrument_type,
+                    instrument_id,
+                    algo_id,
+                    algo_client_order_id,
+                    state,
+                    limit,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist =
+                    PyList::new(py, reports.into_iter().map(|r| r.into_py_any_unwrap(py)))?;
+                Ok((pylist, errors).into_py_any_unwrap(py))
+            })
+        })
+    }
+
     #[pyo3(name = "request_algo_order_status_report")]
     fn py_request_algo_order_status_report<'py>(
         &self,

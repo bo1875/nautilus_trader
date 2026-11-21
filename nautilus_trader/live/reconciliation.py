@@ -48,6 +48,19 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
+class IncompleteOrderStatusReports(RuntimeError):
+    """
+    An order query failed to establish complete coverage.
+
+    The retained reports are valid positive observations. They may be reconciled,
+    but missing orders must not be inferred from this incomplete collection.
+    """
+
+    def __init__(self, reports: list[OrderStatusReport]) -> None:
+        super().__init__("Order status query incomplete; absence is unresolved")
+        self.reports = list(reports)
+
+
 def is_within_single_unit_tolerance(
     value1: Decimal,
     value2: Decimal,

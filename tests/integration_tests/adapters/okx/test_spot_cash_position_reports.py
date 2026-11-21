@@ -446,11 +446,8 @@ async def test_spot_position_reports_handles_exceptions(
         ts_init=0,
     )
 
-    # Act
-    reports = await client.generate_position_status_reports(command)
-
-    # Assert - should return empty list and log exception
-    assert len(reports) == 0
+    with pytest.raises(Exception, match="API error"):
+        await client.generate_position_status_reports(command)
 
 
 @pytest.mark.asyncio

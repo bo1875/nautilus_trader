@@ -126,9 +126,45 @@ pub enum ParsedOrderEvent {
     StatusOnly(Box<OrderStatusReport>),
 }
 
+/// Parses authoritative order terms independently of fills or prior adapter state.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn parse_order_updated(
+    msg: &OKXOrderMsg,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderUpdated> {
+    let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
+    let price = if is_market_price(&msg.px) {
+        None
+    } else {
+        Some(parse_price(&msg.px, instrument.price_precision())?)
+    };
+    Ok(OrderUpdated::new(
+        trader_id,
+        strategy_id,
+        instrument.id(),
+        client_order_id,
+        quantity,
+        UUID4::new(),
+        parse_millisecond_timestamp(msg.u_time),
+        ts_init,
+        false, // An orders push is not a reconciliation report.
+        Some(VenueOrderId::new(msg.ord_id)),
+        Some(account_id),
+        price,
+        None,
+        None,
+    ))
+}
+
 /// Snapshot of order state for detecting updates.
 #[derive(Debug, Clone)]
 pub struct OrderStateSnapshot {
+    pub ts_event: UnixNanos,
     pub venue_order_id: VenueOrderId,
     pub quantity: Quantity,
     pub price: Option<Price>,
@@ -182,30 +218,16 @@ pub fn parse_order_event(
         && let Some(prev) = previous_state
         && is_order_updated_excluding_venue_id_for_live(msg, prev, instrument)?
     {
-        let ts_event = parse_millisecond_timestamp(msg.u_time);
-        let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
-        let price = if is_market_price(&msg.px) {
-            None
-        } else {
-            Some(parse_price(&msg.px, instrument.price_precision())?)
-        };
-
-        return Ok(ParsedOrderEvent::Updated(OrderUpdated::new(
+        return parse_order_updated(
+            msg,
+            client_order_id,
+            account_id,
             trader_id,
             strategy_id,
-            instrument_id,
-            client_order_id,
-            quantity,
-            UUID4::new(),
-            ts_event,
+            instrument,
             ts_init,
-            false, // reconciliation
-            Some(venue_order_id),
-            Some(account_id),
-            price,
-            None, // trigger_price
-            None, // protection_price
-        )));
+        )
+        .map(ParsedOrderEvent::Updated);
     }
 
     match msg.state {
@@ -403,15 +425,35 @@ pub fn parse_book_msg_vec(
 ) -> anyhow::Result<Vec<Data>> {
     let mut deltas = Vec::with_capacity(data.len());
 
-    for msg in data {
-        let deltas_api = OrderBookDeltas_API::new(parse_book_msg(
-            &msg,
-            *instrument_id,
-            price_precision,
-            size_precision,
-            &action,
-            ts_init,
-        )?);
+    for (row, msg) in data.into_iter().enumerate() {
+        // OKX sends an unchanged sequence with empty sides as a keepalive.
+        // It carries no book mutation and must not discard neighboring updates.
+        if action == OKXBookAction::Update
+            && msg.asks.is_empty()
+            && msg.bids.is_empty()
+            && msg.prev_seq_id.and_then(|seq| u64::try_from(seq).ok()) == Some(msg.seq_id)
+        {
+            continue;
+        }
+        let deltas_api = OrderBookDeltas_API::new(
+            parse_book_msg(
+                &msg,
+                *instrument_id,
+                price_precision,
+                size_precision,
+                &action,
+                ts_init,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{instrument_id} {action:?} row={row} seq={} prev={:?} bids={} asks={}: {error}",
+                    msg.seq_id,
+                    msg.prev_seq_id,
+                    msg.bids.len(),
+                    msg.asks.len(),
+                )
+            })?,
+        );
         deltas.push(Data::Deltas(deltas_api));
     }
 
@@ -2081,6 +2123,99 @@ mod tests {
         } else {
             panic!("Expected Deltas");
         }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(123456)]
+    fn test_parse_book_vec_keepalive_has_no_mutation(#[case] sequence: u64) {
+        let msg: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": sequence,
+        }))
+        .unwrap();
+        let result = parse_book_msg_vec(
+            vec![msg],
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            OKXBookAction::Update,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn test_parse_book_vec_keepalive_preserves_neighbor(#[case] keepalive_first: bool) {
+        let event: OKXWsMessage =
+            serde_json::from_str(&load_test_json("ws_books_update.json")).unwrap();
+        let OKXWsMessage::BookData {
+            mut data, action, ..
+        } = event
+        else {
+            panic!("Expected BookData");
+        };
+        let sequence = if keepalive_first { 123456 } else { 123457 };
+        let keepalive: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": sequence,
+        }))
+        .unwrap();
+        if keepalive_first {
+            data.insert(0, keepalive);
+        } else {
+            data.push(keepalive);
+        }
+        let result = parse_book_msg_vec(
+            data,
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            action,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let Data::Deltas(delta) = &result[0] else {
+            panic!("Expected Deltas");
+        };
+        assert_eq!(delta.sequence, 123457);
+        assert_eq!(delta.deltas.len(), 16);
+    }
+
+    #[rstest]
+    #[case(OKXBookAction::Snapshot, Some(10), 10)]
+    #[case(OKXBookAction::Update, Some(9), 10)]
+    #[case(OKXBookAction::Update, None, 10)]
+    #[case(OKXBookAction::Update, Some(-1), u64::MAX)]
+    fn test_parse_book_vec_invalid_empty_still_rejected(
+        #[case] action: OKXBookAction,
+        #[case] previous: Option<i64>,
+        #[case] sequence: u64,
+    ) {
+        let msg: OKXBookMsg = serde_json::from_value(serde_json::json!({
+            "asks": [], "bids": [], "ts": "1700000000000",
+            "seqId": sequence, "prevSeqId": previous,
+        }))
+        .unwrap();
+        let error = parse_book_msg_vec(
+            vec![msg],
+            &InstrumentId::from("BTC-USDT.OKX"),
+            2,
+            1,
+            action,
+            UnixNanos::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deltas"));
+        assert!(error.contains("row=0"));
+        assert!(error.contains(&format!("seq={sequence}")));
+        assert!(error.contains(&format!("prev={previous:?}")));
+        assert!(error.contains("bids=0 asks=0"));
     }
 
     #[rstest]
@@ -4280,6 +4415,7 @@ mod tests {
         let ts_init = UnixNanos::from(1000000000);
 
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4325,6 +4461,7 @@ mod tests {
         let strategy_id = StrategyId::new("STRATEGY-001");
         let ts_init = UnixNanos::from(1000000000);
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4600,6 +4737,7 @@ mod tests {
         let ts_init = UnixNanos::from(1000000000);
 
         let previous_state = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_456"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4642,6 +4780,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4664,6 +4803,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"), // Old quantity
             price: Some(Price::from("50000.00")),
@@ -4686,6 +4826,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"), // Old venue ID
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),
@@ -4708,6 +4849,7 @@ mod tests {
         );
 
         let previous = OrderStateSnapshot {
+            ts_event: UnixNanos::default(),
             venue_order_id: VenueOrderId::new("venue_123"),
             quantity: Quantity::from("0.01000000"),
             price: Some(Price::from("50000.00")),

@@ -18,6 +18,8 @@
 pub mod auth;
 pub mod client;
 pub mod config;
+#[cfg(not(feature = "turmoil"))]
+mod connect;
 pub mod consts;
 pub mod subscription;
 pub mod types;
