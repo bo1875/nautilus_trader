@@ -41,7 +41,7 @@ use tokio_tungstenite::MaybeTlsStream;
 #[cfg(feature = "turmoil")]
 use tokio_tungstenite::client_async;
 #[cfg(not(feature = "turmoil"))]
-use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::{
     Error, Message, client::IntoClientRequest, http::HeaderValue,
 };
@@ -258,7 +258,7 @@ impl WebSocketClientInner {
     }
 
     /// Connects with the server creating a tokio-tungstenite websocket stream.
-    /// Production version that uses `connect_async_with_config` convenience helper.
+    /// Staggers alternate TCP routes while preserving the original TLS request.
     ///
     /// # Errors
     ///
@@ -283,7 +283,25 @@ impl WebSocketClientInner {
             req_headers.insert(header_name, header_value);
         }
 
-        connect_async_with_config(request, None, true)
+        let uri = request.uri();
+        let host = uri.host().ok_or(Error::Url(
+            tokio_tungstenite::tungstenite::error::UrlError::NoHostName,
+        ))?;
+        let port = uri
+            .port_u16()
+            .or_else(|| match uri.scheme_str() {
+                Some("wss") => Some(443),
+                Some("ws") => Some(80),
+                _ => None,
+            })
+            .ok_or(Error::Url(
+                tokio_tungstenite::tungstenite::error::UrlError::UnsupportedUrlScheme,
+            ))?;
+        let socket =
+            super::connect::connect_tcp(host.trim_start_matches('[').trim_end_matches(']'), port)
+                .await?;
+        socket.set_nodelay(true)?;
+        client_async_tls_with_config(request, socket, None, None)
             .await
             .map(|resp| resp.0.split())
     }
